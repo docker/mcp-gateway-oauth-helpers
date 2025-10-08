@@ -28,6 +28,9 @@ import (
 // 5. Always fetch Authorization Server Metadata (required)
 // 6. Build discovery result with whatever information is available
 func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discovery, error) {
+	// Extract logger from context (or use default)
+	logger := LoggerFromContext(ctx)
+
 	// Create HTTP client with reasonable timeout
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -61,7 +64,7 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 
 	// If not 401, OAuth is not required (Authorization is OPTIONAL per MCP spec Section 2.1)
 	if resp.StatusCode != http.StatusUnauthorized {
-		fmt.Printf("warning: status code is not 401: %d\n", resp.StatusCode)
+		logger.Warnf("status code is not 401: %d", resp.StatusCode)
 	}
 
 	// STEP 2: Parse WWW-Authenticate header (if present)
@@ -74,7 +77,7 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 		challenges, err = ParseWWWAuthenticate(wwwAuth)
 		if err != nil {
 			// WWW-Authenticate header exists but isn't parseable - log but continue
-			fmt.Printf("warning: could not parse WWW-Authenticate header: %v\n", err)
+			logger.Warnf("could not parse WWW-Authenticate header: %v", err)
 			challenges = nil
 		}
 	}
