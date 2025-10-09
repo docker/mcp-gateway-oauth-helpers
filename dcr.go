@@ -41,7 +41,6 @@ func PerformDCR(ctx context.Context, discovery *Discovery, serverName string) (*
 	// Add requested scopes if provided
 	if len(discovery.Scopes) > 0 {
 		registration.Scope = joinScopes(discovery.Scopes)
-	} else {
 	}
 
 	// Marshal the registration request
