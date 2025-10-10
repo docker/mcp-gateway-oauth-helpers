@@ -126,7 +126,7 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	} else {
 		// No resource_metadata in WWW-Authenticate - try well-known endpoint
 		wellKnownURL := fmt.Sprintf("%s/.well-known/oauth-protected-resource", defaultAuthServerURL)
-		logger.Infof("FALLBACK: trying well-known resource metadata endpoint: %s", wellKnownURL)
+		logger.Infof("fallback: trying well-known resource metadata endpoint: %s", wellKnownURL)
 		resourceMetadata, resourceMetadataError = fetchOAuthProtectedResourceMetadata(ctx, client, wellKnownURL)
 		if resourceMetadataError == nil && resourceMetadata != nil && resourceMetadata.AuthorizationServer != "" {
 			authServerURL = resourceMetadata.AuthorizationServer
