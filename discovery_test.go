@@ -66,7 +66,7 @@ func TestDiscoveryFallback_NoWWWAuthenticate(t *testing.T) {
 	}
 
 	// Verify fallback was triggered
-	if !logger.containsInfo("FALLBACK: trying well-known") {
+	if !logger.containsInfo("fallback: trying well-known") {
 		t.Error("Expected fallback to well-known endpoint to be triggered")
 	}
 	if !logger.containsInfo("no WWW-Authenticate header present") {
