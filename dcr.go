@@ -9,6 +9,8 @@ import (
 	"net/http"
 )
 
+const DefaultRedirectURI = "https://mcp.docker.com/oauth/callback"
+
 // PerformDCR performs Dynamic Client Registration with the authorization server
 // Returns client credentials for the registered public client
 //
@@ -23,10 +25,8 @@ func PerformDCR(ctx context.Context, discovery *Discovery, serverName string) (*
 
 	// Build DCR request for PUBLIC client
 	registration := DCRRequest{
-		ClientName: fmt.Sprintf("MCP Gateway - %s", serverName),
-		RedirectURIs: []string{
-			"https://mcp.docker.com/oauth/callback", // mcp-oauth proxy callback only
-		},
+		ClientName:              fmt.Sprintf("MCP Gateway - %s", serverName),
+		RedirectURIs:            []string{DefaultRedirectURI},
 		TokenEndpointAuthMethod: "none", // PUBLIC client (no client secret)
 		GrantTypes:              []string{"authorization_code", "refresh_token"},
 		ResponseTypes:           []string{"code"},
@@ -41,7 +41,6 @@ func PerformDCR(ctx context.Context, discovery *Discovery, serverName string) (*
 	// Add requested scopes if provided
 	if len(discovery.Scopes) > 0 {
 		registration.Scope = joinScopes(discovery.Scopes)
-	} else {
 	}
 
 	// Marshal the registration request

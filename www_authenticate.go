@@ -191,20 +191,3 @@ func FindRequiredScopes(challenges []WWWAuthenticateChallenge) []string {
 
 	return scopes
 }
-
-// FindRealm extracts the realm parameter from WWW-Authenticate challenges
-//
-// RFC 7235 COMPLIANCE:
-// - Section 2.2: Defines realm parameter format
-// - Returns the first realm found across all challenges
-func FindRealm(challenges []WWWAuthenticateChallenge) string {
-	for _, challenge := range challenges {
-		if challenge.Parameters == nil {
-			continue
-		}
-		if realm, exists := challenge.Parameters["realm"]; exists && realm != "" {
-			return realm
-		}
-	}
-	return ""
-}
