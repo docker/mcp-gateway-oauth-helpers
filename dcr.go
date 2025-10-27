@@ -18,15 +18,22 @@ const DefaultRedirectURI = "https://mcp.docker.com/oauth/callback"
 // - Uses token_endpoint_auth_method="none" for public clients
 // - Includes redirect_uris pointing to mcp-oauth proxy
 // - Requests authorization_code and refresh_token grant types
-func PerformDCR(ctx context.Context, discovery *Discovery, serverName string) (*ClientCredentials, error) {
+//
+// redirectURI: The OAuth callback URI to register. If empty, uses DefaultRedirectURI.
+func PerformDCR(ctx context.Context, discovery *Discovery, serverName string, redirectURI string) (*ClientCredentials, error) {
 	if discovery.RegistrationEndpoint == "" {
 		return nil, fmt.Errorf("no registration endpoint found for %s", serverName)
+	}
+
+	// Use provided redirectURI, fallback to default if empty
+	if redirectURI == "" {
+		redirectURI = DefaultRedirectURI
 	}
 
 	// Build DCR request for PUBLIC client
 	registration := DCRRequest{
 		ClientName:              fmt.Sprintf("MCP Gateway - %s", serverName),
-		RedirectURIs:            []string{DefaultRedirectURI},
+		RedirectURIs:            []string{redirectURI},
 		TokenEndpointAuthMethod: "none", // PUBLIC client (no client secret)
 		GrantTypes:              []string{"authorization_code", "refresh_token"},
 		ResponseTypes:           []string{"code"},

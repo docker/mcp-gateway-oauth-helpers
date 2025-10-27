@@ -39,8 +39,8 @@ func TestPerformDCR_PublicClient(t *testing.T) {
 		Scopes:                []string{"read", "write"},
 	}
 
-	// Perform DCR
-	creds, err := PerformDCR(context.Background(), discovery, "test-server")
+	// Perform DCR (empty redirectURI uses default)
+	creds, err := PerformDCR(context.Background(), discovery, "test-server", "")
 	// Verify no error
 	if err != nil {
 		t.Fatalf("DCR failed: %v", err)
@@ -82,8 +82,8 @@ func TestPerformDCR_NoRegistrationEndpoint(t *testing.T) {
 		RegistrationEndpoint:  "", // Empty - DCR not supported
 	}
 
-	// Attempt DCR
-	creds, err := PerformDCR(context.Background(), discovery, "test-server")
+	// Attempt DCR (empty redirectURI uses default)
+	creds, err := PerformDCR(context.Background(), discovery, "test-server", "")
 
 	// Verify error occurred
 	if err == nil {
