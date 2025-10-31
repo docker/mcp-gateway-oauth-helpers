@@ -39,8 +39,8 @@ func TestPerformDCR_PublicClient(t *testing.T) {
 		Scopes:                []string{"read", "write"},
 	}
 
-	// Perform DCR
-	creds, err := PerformDCR(context.Background(), discovery, "test-server")
+	// Perform DCR (empty redirectURI uses default)
+	creds, err := PerformDCR(context.Background(), discovery, "test-server", "")
 	// Verify no error
 	if err != nil {
 		t.Fatalf("DCR failed: %v", err)
@@ -82,8 +82,8 @@ func TestPerformDCR_NoRegistrationEndpoint(t *testing.T) {
 		RegistrationEndpoint:  "", // Empty - DCR not supported
 	}
 
-	// Attempt DCR
-	creds, err := PerformDCR(context.Background(), discovery, "test-server")
+	// Attempt DCR (empty redirectURI uses default)
+	creds, err := PerformDCR(context.Background(), discovery, "test-server", "")
 
 	// Verify error occurred
 	if err == nil {
@@ -91,5 +91,88 @@ func TestPerformDCR_NoRegistrationEndpoint(t *testing.T) {
 	}
 	if creds != nil {
 		t.Error("Expected nil credentials on error")
+	}
+}
+
+// TestIsValidRedirectURI verifies redirect URI validation logic
+func TestIsValidRedirectURI(t *testing.T) {
+	tests := []struct {
+		name        string
+		redirectURI string
+		expectError bool
+		description string
+	}{
+		{
+			name:        "empty string",
+			redirectURI: "",
+			expectError: false,
+			description: "Empty string should be allowed (uses default)",
+		},
+		{
+			name:        "localhost http",
+			redirectURI: "http://localhost:5000/callback",
+			expectError: false,
+			description: "Localhost with HTTP should be allowed",
+		},
+		{
+			name:        "localhost https",
+			redirectURI: "https://localhost:5000/callback",
+			expectError: false,
+			description: "Localhost with HTTPS should be allowed",
+		},
+		{
+			name:        "127.0.0.1",
+			redirectURI: "http://127.0.0.1:8080/callback",
+			expectError: false,
+			description: "127.0.0.1 should be allowed",
+		},
+		{
+			name:        "IPv6 localhost",
+			redirectURI: "http://[::1]:8080/callback",
+			expectError: false,
+			description: "IPv6 localhost should be allowed",
+		},
+		{
+			name:        "mcp.docker.com production",
+			redirectURI: "https://mcp.docker.com/oauth/callback",
+			expectError: false,
+			description: "Production mcp.docker.com should be allowed",
+		},
+		{
+			name:        "evil domain",
+			redirectURI: "https://evil.com/callback",
+			expectError: true,
+			description: "Arbitrary domains should be blocked",
+		},
+		{
+			name:        "attacker ngrok",
+			redirectURI: "https://attacker.ngrok.io/callback",
+			expectError: true,
+			description: "Attacker-controlled domains should be blocked",
+		},
+		{
+			name:        "subdomain of docker.com",
+			redirectURI: "https://evil.docker.com/callback",
+			expectError: true,
+			description: "Only mcp.docker.com should be allowed, not subdomains",
+		},
+		{
+			name:        "invalid URL",
+			redirectURI: "not-a-valid-url",
+			expectError: true,
+			description: "Invalid URL format should be rejected",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := isValidRedirectURI(tt.redirectURI)
+			if tt.expectError && err == nil {
+				t.Errorf("Expected error for %q (%s)", tt.redirectURI, tt.description)
+			}
+			if !tt.expectError && err != nil {
+				t.Errorf("Unexpected error for %q: %v (%s)", tt.redirectURI, err, tt.description)
+			}
+		})
 	}
 }
