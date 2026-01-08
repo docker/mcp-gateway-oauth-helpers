@@ -187,3 +187,47 @@ func TestDiscoveryError_AuthServerFails(t *testing.T) {
 		t.Errorf("Expected auth server error, got: %v", err)
 	}
 }
+
+// TestBuildRFC8414WellKnownURL verifies RFC 8414 Section 3.1 URL construction
+func TestBuildRFC8414WellKnownURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		issuer   string
+		expected string
+		wantErr  bool
+	}{
+		{
+			name:     "simple issuer without path",
+			issuer:   "https://example.com",
+			expected: "https://example.com/.well-known/oauth-authorization-server",
+		},
+		{
+			name:     "issuer with path",
+			issuer:   "https://access.stripe.com/mcp",
+			expected: "https://access.stripe.com/.well-known/oauth-authorization-server/mcp",
+		},
+		{
+			name:    "invalid URL",
+			issuer:  "://invalid",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := buildRFC8414WellKnownURL(tt.issuer)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for issuer %q, got nil", tt.issuer)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for issuer %q: %v", tt.issuer, err)
+			}
+			if result != tt.expected {
+				t.Errorf("buildRFC8414WellKnownURL(%q)\n  got:  %s\n  want: %s", tt.issuer, result, tt.expected)
+			}
+		})
+	}
+}

@@ -247,19 +247,37 @@ func fetchOAuthProtectedResourceMetadata(ctx context.Context, client *http.Clien
 	return &metadata, nil
 }
 
+// buildRFC8414WellKnownURL constructs the well-known URL per RFC 8414 Section 3.1
+// Inserts /.well-known/oauth-authorization-server between host and path.
+func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
+	parsed, err := url.Parse(issuerURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid issuer URL: %w", err)
+	}
+
+	// RFC 8414 Section 3.1: Insert .well-known between host and path
+	// Path may be empty, "/" or "/some/path"
+	path := parsed.Path
+	if path == "/" {
+		path = ""
+	}
+
+	return fmt.Sprintf("%s://%s/.well-known/oauth-authorization-server%s",
+		parsed.Scheme, parsed.Host, path), nil
+}
+
 // fetchAuthorizationServerMetadata fetches metadata from /.well-known/oauth-authorization-server
 //
 // RFC 8414 COMPLIANCE:
 // - Implements RFC 8414 Section 3 "Authorization Server Metadata"
+// - Implements RFC 8414 Section 3.1 for well-known URL construction with path support
 // - Validates required fields: issuer, authorization_endpoint, token_endpoint
 // - Validates issuer URL matches authorization server URL (RFC 8414 Section 3.2)
 func fetchAuthorizationServerMetadata(ctx context.Context, client *http.Client, authServerURL string) (*AuthorizationServerMetadata, error) {
-	// RFC 8414 Section 3: Construct well-known URL
-	var metadataURL string
-	if strings.HasSuffix(authServerURL, "/") {
-		metadataURL = authServerURL + ".well-known/oauth-authorization-server"
-	} else {
-		metadataURL = authServerURL + "/.well-known/oauth-authorization-server"
+	// RFC 8414 Section 3.1: Construct well-known URL (handles issuer paths correctly)
+	metadataURL, err := buildRFC8414WellKnownURL(authServerURL)
+	if err != nil {
+		return nil, fmt.Errorf("building well-known URL: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
