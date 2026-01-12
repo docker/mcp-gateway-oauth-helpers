@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,21 @@ import (
 	"strings"
 	"testing"
 )
+
+// setupTestHTTPClient configures httpClientFunc to accept test TLS certificates
+func setupTestHTTPClient(_ *testing.T) func() {
+	original := httpClientFunc
+	httpClientFunc = func() *http.Client {
+		return &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+	}
+	return func() {
+		httpClientFunc = original
+	}
+}
 
 // TestDiscoveryFallback_NoWWWAuthenticate verifies the critical fallback behavior
 // when MCP server doesn't provide WWW-Authenticate header
@@ -18,11 +34,14 @@ import (
 // - Don't provide WWW-Authenticate header (MCP spec violation)
 // - Do provide /.well-known/oauth-protected-resource endpoint (RFC 9728 compliant)
 func TestDiscoveryFallback_NoWWWAuthenticate(t *testing.T) {
-	// Mock authorization server
-	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	// Mock authorization server (TLS)
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/.well-known/oauth-authorization-server") {
-			// Use r.Host to construct URLs dynamically
-			baseURL := "http://" + r.Host
+			// Use https scheme for test server
+			baseURL := "https://" + r.Host
 			_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
 				Issuer:                        baseURL,
 				AuthorizationEndpoint:         baseURL + "/authorize",
@@ -35,8 +54,8 @@ func TestDiscoveryFallback_NoWWWAuthenticate(t *testing.T) {
 	}))
 	defer authServer.Close()
 
-	// Mock MCP server (returns 401 WITHOUT WWW-Authenticate)
-	mcpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Mock MCP server (returns 401 WITHOUT WWW-Authenticate) - TLS
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/mcp" {
 			// Return 401 WITHOUT WWW-Authenticate header (Neon behavior)
 			w.WriteHeader(http.StatusUnauthorized)
@@ -44,10 +63,10 @@ func TestDiscoveryFallback_NoWWWAuthenticate(t *testing.T) {
 		}
 		if r.URL.Path == "/.well-known/oauth-protected-resource" {
 			// Provide resource metadata at well-known endpoint
-			baseURL := "http://" + r.Host
+			baseURL := "https://" + r.Host
 			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
 				Resource:            baseURL,
-				AuthorizationServer: authServer.URL,
+				AuthorizationServer: authServer.URL, // httptest.NewTLSServer URL is already https
 			})
 			return
 		}
@@ -88,10 +107,13 @@ func TestDiscoveryFallback_NoWWWAuthenticate(t *testing.T) {
 // TestDiscoveryHappyPath_WithWWWAuthenticate verifies the standard flow
 // when server provides proper WWW-Authenticate header
 func TestDiscoveryHappyPath_WithWWWAuthenticate(t *testing.T) {
-	// Mock authorization server
-	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	// Mock authorization server (TLS)
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/.well-known/oauth-authorization-server") {
-			baseURL := "http://" + r.Host
+			baseURL := "https://" + r.Host
 			_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
 				Issuer:                        baseURL,
 				AuthorizationEndpoint:         baseURL + "/authorize",
@@ -103,8 +125,8 @@ func TestDiscoveryHappyPath_WithWWWAuthenticate(t *testing.T) {
 	}))
 	defer authServer.Close()
 
-	// Mock metadata server (separate from MCP server)
-	metadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// Mock metadata server (separate from MCP server) - TLS
+	metadataServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
 			Resource:            "https://api.example.com",
 			AuthorizationServer: authServer.URL,
@@ -113,8 +135,8 @@ func TestDiscoveryHappyPath_WithWWWAuthenticate(t *testing.T) {
 	}))
 	defer metadataServer.Close()
 
-	// Mock MCP server (returns 401 WITH WWW-Authenticate)
-	mcpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Mock MCP server (returns 401 WITH WWW-Authenticate) - TLS
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/mcp" {
 			// Return 401 WITH WWW-Authenticate header (standard MCP behavior)
 			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer realm=\"test\", resource_metadata=\"%s\"", metadataServer.URL))
@@ -155,18 +177,21 @@ func TestDiscoveryHappyPath_WithWWWAuthenticate(t *testing.T) {
 // TestDiscoveryError_AuthServerFails verifies error handling
 // when authorization server metadata cannot be fetched
 func TestDiscoveryError_AuthServerFails(t *testing.T) {
-	// Mock MCP server (returns 401, no WWW-Authenticate)
-	mcpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	// Mock MCP server (returns 401, no WWW-Authenticate) - TLS
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/mcp" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		if r.URL.Path == "/.well-known/oauth-protected-resource" {
 			// Return resource metadata pointing to non-existent auth server
-			baseURL := "http://" + r.Host
+			baseURL := "https://" + r.Host
 			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
 				Resource:            baseURL,
-				AuthorizationServer: "http://localhost:99999", // Invalid/unreachable
+				AuthorizationServer: "https://localhost:99999", // Invalid/unreachable
 			})
 			return
 		}
@@ -185,5 +210,76 @@ func TestDiscoveryError_AuthServerFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "fetching authorization server metadata") {
 		t.Errorf("Expected auth server error, got: %v", err)
+	}
+}
+
+// TestBuildRFC8414WellKnownURL verifies RFC 8414 Section 3.1 URL construction
+func TestBuildRFC8414WellKnownURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		issuer   string
+		expected string
+		wantErr  bool
+		errMsg   string
+	}{
+		{
+			name:     "simple issuer without path",
+			issuer:   "https://example.com",
+			expected: "https://example.com/.well-known/oauth-authorization-server",
+		},
+		{
+			name:     "issuer with path",
+			issuer:   "https://access.stripe.com/mcp",
+			expected: "https://access.stripe.com/.well-known/oauth-authorization-server/mcp",
+		},
+		{
+			name:     "issuer with uppercase host (should lowercase)",
+			issuer:   "https://EXAMPLE.COM/path",
+			expected: "https://example.com/.well-known/oauth-authorization-server/path",
+		},
+		{
+			name:    "invalid URL",
+			issuer:  "://invalid",
+			wantErr: true,
+			errMsg:  "invalid issuer URL",
+		},
+		{
+			name:    "http scheme rejected (RFC 8414 requires https)",
+			issuer:  "http://example.com",
+			wantErr: true,
+			errMsg:  "must use https scheme",
+		},
+		{
+			name:    "query parameters rejected (RFC 8414 Section 2)",
+			issuer:  "https://example.com?foo=bar",
+			wantErr: true,
+			errMsg:  "must not contain query parameters",
+		},
+		{
+			name:    "fragment rejected (RFC 8414 Section 2)",
+			issuer:  "https://example.com#fragment",
+			wantErr: true,
+			errMsg:  "must not contain fragment",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := buildRFC8414WellKnownURL(tt.issuer)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for issuer %q, got nil", tt.issuer)
+				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("expected error containing %q, got: %v", tt.errMsg, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for issuer %q: %v", tt.issuer, err)
+			}
+			if result != tt.expected {
+				t.Errorf("buildRFC8414WellKnownURL(%q)\n  got:  %s\n  want: %s", tt.issuer, result, tt.expected)
+			}
+		})
 	}
 }

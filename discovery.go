@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// httpClientFunc allows tests to inject a custom HTTP client (e.g., for TLS test servers)
+var httpClientFunc = func() *http.Client {
+	return &http.Client{Timeout: 30 * time.Second}
+}
+
 // DiscoverOAuthRequirements probes an MCP server to discover OAuth requirements
 //
 // MCP AUTHORIZATION SPEC COMPLIANCE:
@@ -36,10 +41,8 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 
 	logger.Infof("starting OAuth discovery for server: %s", serverURL)
 
-	// Create HTTP client with reasonable timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// Create HTTP client (can be overridden in tests for TLS support)
+	client := httpClientFunc()
 
 	// Parse server URL to extract base domain for defaults
 	parsedURL, err := url.Parse(serverURL)
@@ -247,19 +250,55 @@ func fetchOAuthProtectedResourceMetadata(ctx context.Context, client *http.Clien
 	return &metadata, nil
 }
 
+// buildRFC8414WellKnownURL constructs the well-known URL per RFC 8414 Section 3.1
+// Inserts /.well-known/oauth-authorization-server between host and path.
+func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
+	parsed, err := url.Parse(issuerURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid issuer URL: %w", err)
+	}
+
+	// RFC 8414 Section 2: issuer must use https scheme
+	if parsed.Scheme != "https" {
+		return "", fmt.Errorf("issuer URL must use https scheme")
+	}
+
+	// RFC 8414 Section 2: issuer must not have query
+	if parsed.RawQuery != "" {
+		return "", fmt.Errorf("issuer URL must not contain query parameters")
+	}
+
+	// RFC 8414 Section 2: issuer must not have fragment
+	if parsed.Fragment != "" {
+		return "", fmt.Errorf("issuer URL must not contain fragment")
+	}
+
+	// RFC 3986 Section 3.2.2: host is case-insensitive, canonicalize to lowercase
+	host := strings.ToLower(parsed.Host)
+
+	// RFC 8414 Section 3.1: Insert .well-known between host and path
+	// Path may be empty, "/" or "/some/path"
+	path := parsed.Path
+	if path == "/" {
+		path = ""
+	}
+
+	return fmt.Sprintf("https://%s/.well-known/oauth-authorization-server%s",
+		host, path), nil
+}
+
 // fetchAuthorizationServerMetadata fetches metadata from /.well-known/oauth-authorization-server
 //
 // RFC 8414 COMPLIANCE:
 // - Implements RFC 8414 Section 3 "Authorization Server Metadata"
+// - Implements RFC 8414 Section 3.1 for well-known URL construction with path support
 // - Validates required fields: issuer, authorization_endpoint, token_endpoint
 // - Validates issuer URL matches authorization server URL (RFC 8414 Section 3.2)
 func fetchAuthorizationServerMetadata(ctx context.Context, client *http.Client, authServerURL string) (*AuthorizationServerMetadata, error) {
-	// RFC 8414 Section 3: Construct well-known URL
-	var metadataURL string
-	if strings.HasSuffix(authServerURL, "/") {
-		metadataURL = authServerURL + ".well-known/oauth-authorization-server"
-	} else {
-		metadataURL = authServerURL + "/.well-known/oauth-authorization-server"
+	// RFC 8414 Section 3.1: Construct well-known URL (handles issuer paths correctly)
+	metadataURL, err := buildRFC8414WellKnownURL(authServerURL)
+	if err != nil {
+		return nil, fmt.Errorf("building well-known URL: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
