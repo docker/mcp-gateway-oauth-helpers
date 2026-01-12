@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// httpClientFunc allows tests to inject a custom HTTP client (e.g., for TLS test servers)
+var httpClientFunc = func() *http.Client {
+	return &http.Client{Timeout: 30 * time.Second}
+}
+
 // DiscoverOAuthRequirements probes an MCP server to discover OAuth requirements
 //
 // MCP AUTHORIZATION SPEC COMPLIANCE:
@@ -36,10 +41,8 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 
 	logger.Infof("starting OAuth discovery for server: %s", serverURL)
 
-	// Create HTTP client with reasonable timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// Create HTTP client (can be overridden in tests for TLS support)
+	client := httpClientFunc()
 
 	// Parse server URL to extract base domain for defaults
 	parsedURL, err := url.Parse(serverURL)
@@ -255,6 +258,24 @@ func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
 		return "", fmt.Errorf("invalid issuer URL: %w", err)
 	}
 
+	// RFC 8414 Section 2: issuer must use https scheme
+	if parsed.Scheme != "https" {
+		return "", fmt.Errorf("issuer URL must use https scheme")
+	}
+
+	// RFC 8414 Section 2: issuer must not have query
+	if parsed.RawQuery != "" {
+		return "", fmt.Errorf("issuer URL must not contain query parameters")
+	}
+
+	// RFC 8414 Section 2: issuer must not have fragment
+	if parsed.Fragment != "" {
+		return "", fmt.Errorf("issuer URL must not contain fragment")
+	}
+
+	// RFC 3986 Section 3.2.2: host is case-insensitive, canonicalize to lowercase
+	host := strings.ToLower(parsed.Host)
+
 	// RFC 8414 Section 3.1: Insert .well-known between host and path
 	// Path may be empty, "/" or "/some/path"
 	path := parsed.Path
@@ -262,8 +283,8 @@ func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
 		path = ""
 	}
 
-	return fmt.Sprintf("%s://%s/.well-known/oauth-authorization-server%s",
-		parsed.Scheme, parsed.Host, path), nil
+	return fmt.Sprintf("https://%s/.well-known/oauth-authorization-server%s",
+		host, path), nil
 }
 
 // fetchAuthorizationServerMetadata fetches metadata from /.well-known/oauth-authorization-server
