@@ -139,6 +139,12 @@ func TestIsValidRedirectURI(t *testing.T) {
 			description: "Production mcp.docker.com should be allowed",
 		},
 		{
+			name:        "mcp-stage.docker.com staging",
+			redirectURI: "https://mcp-stage.docker.com/oauth/callback",
+			expectError: false,
+			description: "Staging mcp-stage.docker.com should be allowed",
+		},
+		{
 			name:        "evil domain",
 			redirectURI: "https://evil.com/callback",
 			expectError: true,
@@ -154,7 +160,7 @@ func TestIsValidRedirectURI(t *testing.T) {
 			name:        "subdomain of docker.com",
 			redirectURI: "https://evil.docker.com/callback",
 			expectError: true,
-			description: "Only mcp.docker.com should be allowed, not subdomains",
+			description: "Only mcp.docker.com and mcp-stage.docker.com should be allowed, not other subdomains",
 		},
 		{
 			name:        "invalid URL",
