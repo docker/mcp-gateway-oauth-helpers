@@ -37,7 +37,12 @@ func isValidRedirectURI(redirectURI string) error {
 		return nil
 	}
 
-	return fmt.Errorf("redirect URI host %q not allowed - must be localhost or mcp.docker.com", hostname)
+	// Allow mcp-stage.docker.com (staging)
+	if hostname == "mcp-stage.docker.com" {
+		return nil
+	}
+
+	return fmt.Errorf("redirect URI host %q not allowed - must be localhost, mcp.docker.com, or mcp-stage.docker.com", hostname)
 }
 
 // PerformDCR performs Dynamic Client Registration with the authorization server
