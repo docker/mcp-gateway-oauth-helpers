@@ -172,7 +172,7 @@ func TestIsValidRedirectURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := isValidRedirectURI(tt.redirectURI)
+			err := isValidRedirectURI(tt.redirectURI, nil)
 			if tt.expectError && err == nil {
 				t.Errorf("Expected error for %q (%s)", tt.redirectURI, tt.description)
 			}
@@ -180,5 +180,61 @@ func TestIsValidRedirectURI(t *testing.T) {
 				t.Errorf("Unexpected error for %q: %v (%s)", tt.redirectURI, err, tt.description)
 			}
 		})
+	}
+}
+
+func TestIsValidRedirectURI_CustomAllowedHosts(t *testing.T) {
+	redirectURI := "https://oauth.example.com/callback"
+
+	if err := isValidRedirectURI(redirectURI, nil); err == nil {
+		t.Fatal("Expected custom redirect URI host to be rejected by default allowlist")
+	}
+
+	if err := isValidRedirectURI(redirectURI, []string{"oauth.example.com"}); err != nil {
+		t.Fatalf("Expected custom redirect URI host to be accepted: %v", err)
+	}
+
+	if err := isValidRedirectURI(redirectURI, []string{"https://oauth.example.com/callback"}); err != nil {
+		t.Fatalf("Expected full redirect URI in allowlist to be accepted: %v", err)
+	}
+}
+
+func TestPerformDCRWithConfig_CustomAllowedRedirectURIHost(t *testing.T) {
+	redirectURI := "https://oauth.example.com/callback"
+	var capturedRequest *DCRRequest
+
+	regServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &capturedRequest)
+
+		_ = json.NewEncoder(w).Encode(DCRResponse{
+			ClientID:     "test-client-id-123",
+			RedirectURIs: []string{redirectURI},
+		})
+	}))
+	defer regServer.Close()
+
+	discovery := &Discovery{
+		RegistrationEndpoint:  regServer.URL,
+		AuthorizationEndpoint: "https://auth.example.com/authorize",
+		TokenEndpoint:         "https://auth.example.com/token",
+		ResourceURL:           "https://api.example.com",
+	}
+
+	creds, err := PerformDCRWithConfig(context.Background(), discovery, "test-server", DCRConfig{
+		RedirectURI:             redirectURI,
+		AllowedRedirectURIHosts: []string{"oauth.example.com"},
+	})
+	if err != nil {
+		t.Fatalf("DCR failed: %v", err)
+	}
+	if creds.ClientID != "test-client-id-123" {
+		t.Errorf("Expected ClientID=test-client-id-123, got %s", creds.ClientID)
+	}
+	if capturedRequest == nil {
+		t.Fatal("DCR request not captured")
+	}
+	if len(capturedRequest.RedirectURIs) != 1 || capturedRequest.RedirectURIs[0] != redirectURI {
+		t.Fatalf("Expected redirect_uris=%q, got %#v", redirectURI, capturedRequest.RedirectURIs)
 	}
 }
