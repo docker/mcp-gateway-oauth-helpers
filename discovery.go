@@ -72,9 +72,13 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 
 	logger.Infof("MCP server response: status=%d", resp.StatusCode)
 
-	// If not 401, OAuth might not be required (Authorization is OPTIONAL per MCP spec Section 2.1)
-	// We log a warning but continue discovery attempt in case server is misconfigured
-	if resp.StatusCode != http.StatusUnauthorized {
+	// If not 401, OAuth is likely not required (Authorization is OPTIONAL per
+	// MCP spec Section 2.1). We still attempt metadata discovery in case the
+	// server is misconfigured (needs OAuth but doesn't challenge with 401);
+	// however, if no authorization server metadata can then be discovered, we
+	// treat the server as requiring no OAuth rather than failing (see STEP 5).
+	oauthOptional := resp.StatusCode != http.StatusUnauthorized
+	if oauthOptional {
 		logger.Warnf("expected 401 Unauthorized, got %d - OAuth may not be required", resp.StatusCode)
 	}
 
@@ -143,6 +147,15 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	authServerMetadata, err := fetchAuthorizationServerMetadata(ctx, client, authServerURL)
 	if err != nil {
 		logger.Warnf("failed to fetch authorization server metadata: %v", err)
+		// The server did not challenge with 401 and exposes no discoverable
+		// authorization server metadata: it requires no OAuth (auth is OPTIONAL
+		// per MCP spec Section 2.1), so report that rather than failing. Only a
+		// server that *did* return 401 but lacks usable metadata is a real
+		// (misconfigured-OAuth) error.
+		if oauthOptional {
+			logger.Infof("no authorization server metadata discovered and server did not require auth; treating as no-OAuth")
+			return &Discovery{RequiresOAuth: false}, nil
+		}
 		return nil, fmt.Errorf("fetching authorization server metadata from %s: %w", authServerURL, err)
 	}
 	logger.Infof("auth server metadata retrieved: token_endpoint=%s, registration_endpoint=%s",
