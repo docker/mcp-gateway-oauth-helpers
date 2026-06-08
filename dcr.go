@@ -8,13 +8,37 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 const DefaultRedirectURI = "https://mcp.docker.com/oauth/callback"
 
-// isValidRedirectURI validates that the redirect URI is allowed for this library
-// Only localhost and mcp.docker.com are permitted for security
-func isValidRedirectURI(redirectURI string) error {
+var defaultAllowedRedirectURIHosts = []string{
+	"localhost",
+	"127.0.0.1",
+	"::1",
+	"mcp.docker.com",
+	"mcp-stage.docker.com",
+}
+
+// DCRConfig configures Dynamic Client Registration behavior.
+type DCRConfig struct {
+	// RedirectURI is the OAuth callback URI to register. If empty, DefaultRedirectURI is used.
+	RedirectURI string
+
+	// AllowedRedirectURIHosts is the allowlist of hosts accepted for RedirectURI validation.
+	// Hosts should not include a port. If nil, DefaultAllowedRedirectURIHosts is used.
+	// Use DefaultAllowedRedirectURIHosts() and append to it to keep the built-in hosts.
+	AllowedRedirectURIHosts []string
+}
+
+// DefaultAllowedRedirectURIHosts returns a copy of the built-in redirect URI host allowlist.
+func DefaultAllowedRedirectURIHosts() []string {
+	return append([]string(nil), defaultAllowedRedirectURIHosts...)
+}
+
+// isValidRedirectURI validates that the redirect URI host is allowed.
+func isValidRedirectURI(redirectURI string, allowedHosts []string) error {
 	if redirectURI == "" {
 		return nil // Empty is OK (will use default)
 	}
@@ -26,23 +50,57 @@ func isValidRedirectURI(redirectURI string) error {
 
 	// Extract hostname (handles ports automatically)
 	hostname := parsed.Hostname()
-
-	// Allow localhost variations
-	if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
-		return nil
+	if hostname == "" {
+		return fmt.Errorf("invalid redirect URI %q: missing host", redirectURI)
 	}
 
-	// Allow mcp.docker.com (production)
-	if hostname == "mcp.docker.com" {
-		return nil
+	if allowedHosts == nil {
+		allowedHosts = defaultAllowedRedirectURIHosts
 	}
 
-	// Allow mcp-stage.docker.com (staging)
-	if hostname == "mcp-stage.docker.com" {
-		return nil
+	for _, allowedHost := range allowedHosts {
+		allowedHost = normalizeAllowedRedirectURIHost(allowedHost)
+		if allowedHost == "" {
+			continue
+		}
+		if strings.EqualFold(hostname, allowedHost) {
+			return nil
+		}
 	}
 
-	return fmt.Errorf("redirect URI host %q not allowed - must be localhost, mcp.docker.com, or mcp-stage.docker.com", hostname)
+	return fmt.Errorf("redirect URI host %q not allowed - allowed hosts: %s", hostname, formatAllowedRedirectURIHosts(allowedHosts))
+}
+
+func normalizeAllowedRedirectURIHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+
+	// Be forgiving if callers pass a full redirect URI instead of just a host.
+	if parsed, err := url.Parse(host); err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname()
+	}
+
+	return host
+}
+
+func formatAllowedRedirectURIHosts(hosts []string) string {
+	if len(hosts) == 0 {
+		return "(none)"
+	}
+
+	formatted := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		if normalized := normalizeAllowedRedirectURIHost(host); normalized != "" {
+			formatted = append(formatted, normalized)
+		}
+	}
+	if len(formatted) == 0 {
+		return "(none)"
+	}
+
+	return strings.Join(formatted, ", ")
 }
 
 // PerformDCR performs Dynamic Client Registration with the authorization server
@@ -55,18 +113,24 @@ func isValidRedirectURI(redirectURI string) error {
 //
 // redirectURI: The OAuth callback URI to register. If empty, uses DefaultRedirectURI.
 func PerformDCR(ctx context.Context, discovery *Discovery, serverName string, redirectURI string) (*ClientCredentials, error) {
+	return PerformDCRWithConfig(ctx, discovery, serverName, DCRConfig{RedirectURI: redirectURI})
+}
+
+// PerformDCRWithConfig performs Dynamic Client Registration with configurable DCR behavior.
+func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName string, config DCRConfig) (*ClientCredentials, error) {
 	if discovery.RegistrationEndpoint == "" {
 		return nil, fmt.Errorf("no registration endpoint found for %s", serverName)
 	}
 
-	// Validate redirect URI for security (only localhost or mcp.docker.com allowed)
-	if err := isValidRedirectURI(redirectURI); err != nil {
-		return nil, fmt.Errorf("invalid redirect URI: %w", err)
-	}
-
-	// Use provided redirectURI, fallback to default if empty
+	// Use provided redirectURI, fallback to default if empty.
+	redirectURI := config.RedirectURI
 	if redirectURI == "" {
 		redirectURI = DefaultRedirectURI
+	}
+
+	// Validate redirect URI for security.
+	if err := isValidRedirectURI(redirectURI, config.AllowedRedirectURIHosts); err != nil {
+		return nil, fmt.Errorf("invalid redirect URI: %w", err)
 	}
 
 	// Build DCR request for PUBLIC client
