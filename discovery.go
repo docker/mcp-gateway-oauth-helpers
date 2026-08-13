@@ -107,6 +107,7 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	var resourceMetadata *ProtectedResourceMetadata
 	var resourceMetadataError error
 	authServerURL := defaultAuthServerURL
+	resourceMetadataClient := sameOriginHTTPClient(client, serverURL)
 
 	// STEP 4: Try to get resource metadata (OPTIONAL - don't fail if missing)
 	// RFC 9728 Section 5.1: resource_metadata parameter in WWW-Authenticate
@@ -118,7 +119,16 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	if resourceMetadataURL != "" {
 		// Resource metadata URL found - try to fetch it
 		logger.Infof("fetching protected resource metadata from: %s", resourceMetadataURL)
-		resourceMetadata, resourceMetadataError = fetchOAuthProtectedResourceMetadata(ctx, client, resourceMetadataURL)
+		if err := validateSameOrigin(serverURL, resourceMetadataURL); err != nil {
+			return nil, fmt.Errorf("invalid protected resource metadata URL: %w", err)
+		}
+		resourceMetadata, resourceMetadataError = fetchOAuthProtectedResourceMetadata(ctx, resourceMetadataClient, resourceMetadataURL)
+		if resourceMetadataError != nil {
+			return nil, fmt.Errorf("fetching protected resource metadata from %s: %w", resourceMetadataURL, resourceMetadataError)
+		}
+		if err := validateProtectedResource(serverURL, resourceMetadata.Resource); err != nil {
+			return nil, err
+		}
 		if resourceMetadataError == nil && resourceMetadata != nil && resourceMetadata.AuthorizationServer != "" {
 			// Use authorization server from resource metadata if available
 			authServerURL = resourceMetadata.AuthorizationServer
@@ -128,9 +138,17 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 		}
 	} else {
 		// No resource_metadata in WWW-Authenticate - try well-known endpoint
-		wellKnownURL := fmt.Sprintf("%s/.well-known/oauth-protected-resource", defaultAuthServerURL)
+		wellKnownURL, err := buildRFC9728WellKnownURL(serverURL)
+		if err != nil {
+			return nil, fmt.Errorf("building protected resource metadata URL: %w", err)
+		}
 		logger.Infof("fallback: trying well-known resource metadata endpoint: %s", wellKnownURL)
-		resourceMetadata, resourceMetadataError = fetchOAuthProtectedResourceMetadata(ctx, client, wellKnownURL)
+		resourceMetadata, resourceMetadataError = fetchOAuthProtectedResourceMetadata(ctx, resourceMetadataClient, wellKnownURL)
+		if resourceMetadataError == nil && resourceMetadata != nil {
+			if err := validateProtectedResource(serverURL, resourceMetadata.Resource); err != nil {
+				return nil, err
+			}
+		}
 		if resourceMetadataError == nil && resourceMetadata != nil && resourceMetadata.AuthorizationServer != "" {
 			authServerURL = resourceMetadata.AuthorizationServer
 			logger.Infof("resource metadata from well-known endpoint, auth server: %s", authServerURL)
@@ -153,8 +171,8 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 		RequiresOAuth: true,
 
 		// Use resource metadata if available, otherwise use defaults
-		ResourceURL:         defaultAuthServerURL,
-		ResourceServer:      defaultAuthServerURL,
+		ResourceURL:         serverURL,
+		ResourceServer:      serverURL,
 		AuthorizationServer: authServerURL,
 
 		// From Authorization Server Metadata (RFC 8414) - always available
@@ -333,6 +351,9 @@ func fetchAuthorizationServerMetadata(ctx context.Context, client *http.Client, 
 	if metadata.Issuer == "" {
 		return nil, fmt.Errorf("issuer field missing in authorization server metadata")
 	}
+	if metadata.Issuer != authServerURL {
+		return nil, fmt.Errorf("authorization server metadata issuer %q does not match requested issuer %q", metadata.Issuer, authServerURL)
+	}
 	if metadata.AuthorizationEndpoint == "" {
 		return nil, fmt.Errorf("authorization_endpoint field missing in authorization server metadata")
 	}
@@ -341,13 +362,94 @@ func fetchAuthorizationServerMetadata(ctx context.Context, client *http.Client, 
 	}
 
 	// RFC 8414 Section 3.2: Validate issuer URL is valid
-	// Note: We trust the issuer field in the metadata as authoritative
-	// Cross-domain OAuth setups (like Stripe) are valid where resource server
-	// and authorization server are on different domains
 	_, err = url.Parse(metadata.Issuer)
 	if err != nil {
 		return nil, fmt.Errorf("invalid issuer URL: %w", err)
 	}
 
 	return &metadata, nil
+}
+
+func validateProtectedResource(expected, actual string) error {
+	if actual != expected {
+		return fmt.Errorf("protected resource metadata resource %q does not match requested resource %q", actual, expected)
+	}
+	return nil
+}
+
+func validateSameOrigin(serverURL, metadataURL string) error {
+	server, err := url.Parse(serverURL)
+	if err != nil {
+		return fmt.Errorf("invalid server URL: %w", err)
+	}
+	metadata, err := url.Parse(metadataURL)
+	if err != nil {
+		return fmt.Errorf("invalid metadata URL: %w", err)
+	}
+	if server.Scheme == "" || server.Hostname() == "" || server.User != nil {
+		return fmt.Errorf("server URL must be an absolute URL without user information")
+	}
+	if metadata.Scheme == "" || metadata.Hostname() == "" || metadata.User != nil {
+		return fmt.Errorf("metadata URL must be an absolute URL without user information")
+	}
+
+	serverPort := server.Port()
+	if serverPort == "" {
+		serverPort = defaultPort(server.Scheme)
+	}
+	metadataPort := metadata.Port()
+	if metadataPort == "" {
+		metadataPort = defaultPort(metadata.Scheme)
+	}
+	if !strings.EqualFold(server.Scheme, metadata.Scheme) ||
+		!strings.EqualFold(server.Hostname(), metadata.Hostname()) ||
+		serverPort != metadataPort {
+		return fmt.Errorf("metadata URL %q must use the same origin as MCP server %q", metadataURL, serverURL)
+	}
+	return nil
+}
+
+func sameOriginHTTPClient(client *http.Client, originURL string) *http.Client {
+	cloned := *client
+	cloned.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+		return validateSameOrigin(originURL, req.URL.String())
+	}
+	return &cloned
+}
+
+func defaultPort(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+// buildRFC9728WellKnownURL constructs the protected-resource metadata URL by
+// inserting the well-known suffix before the resource path while preserving
+// its query, as required by RFC 9728 Section 3.1.
+func buildRFC9728WellKnownURL(resourceURL string) (string, error) {
+	parsed, err := url.Parse(resourceURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid resource URL: %w", err)
+	}
+	if parsed.Scheme == "" || parsed.Hostname() == "" || parsed.User != nil {
+		return "", fmt.Errorf("resource URL must be an absolute URL without user information")
+	}
+	if parsed.Fragment != "" {
+		return "", fmt.Errorf("resource URL must not contain fragment")
+	}
+
+	resourcePath := parsed.EscapedPath()
+	if resourcePath == "/" {
+		resourcePath = ""
+	}
+	metadataURL := fmt.Sprintf("%s://%s/.well-known/oauth-protected-resource%s", parsed.Scheme, strings.ToLower(parsed.Host), resourcePath)
+	if parsed.RawQuery != "" {
+		metadataURL += "?" + parsed.RawQuery
+	}
+	return metadataURL, nil
 }
