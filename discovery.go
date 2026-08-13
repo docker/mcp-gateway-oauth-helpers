@@ -109,7 +109,9 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	authServerURL := defaultAuthServerURL
 	resourceMetadataClient := sameOriginHTTPClient(client, serverURL)
 
-	// STEP 4: Try to get resource metadata (OPTIONAL - don't fail if missing)
+	// STEP 4: Resolve protected resource metadata. Discovery may continue when
+	// the fallback well-known endpoint is absent, but explicitly advertised
+	// resource_metadata is authoritative and must be fetched successfully.
 	// RFC 9728 Section 5.1: resource_metadata parameter in WWW-Authenticate
 	resourceMetadataURL := ""
 	if challenges != nil {
@@ -129,12 +131,10 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 		if err := validateProtectedResource(serverURL, resourceMetadata.Resource); err != nil {
 			return nil, err
 		}
-		if resourceMetadataError == nil && resourceMetadata != nil && resourceMetadata.AuthorizationServer != "" {
+		if resourceMetadata != nil && resourceMetadata.AuthorizationServer != "" {
 			// Use authorization server from resource metadata if available
 			authServerURL = resourceMetadata.AuthorizationServer
 			logger.Infof("resource metadata retrieved, auth server: %s", authServerURL)
-		} else if resourceMetadataError != nil {
-			logger.Warnf("failed to fetch resource metadata: %v", resourceMetadataError)
 		}
 	} else {
 		// No resource_metadata in WWW-Authenticate - try well-known endpoint
@@ -158,7 +158,11 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	// STEP 5: Fetch Authorization Server Metadata (REQUIRED)
 	// MCP Spec Section 3.1: "Authorization servers MUST provide OAuth 2.0 Authorization Server Metadata (RFC8414)"
 	logger.Infof("fetching authorization server metadata from: %s", authServerURL)
-	authServerMetadata, err := fetchAuthorizationServerMetadata(ctx, client, authServerURL)
+	authServerClient, err := authorizationServerHTTPClientFunc(client)
+	if err != nil {
+		return nil, fmt.Errorf("securing authorization server metadata client: %w", err)
+	}
+	authServerMetadata, err := fetchAuthorizationServerMetadata(ctx, authServerClient, authServerURL)
 	if err != nil {
 		logger.Warnf("failed to fetch authorization server metadata: %v", err)
 		return nil, fmt.Errorf("fetching authorization server metadata from %s: %w", authServerURL, err)
@@ -276,8 +280,10 @@ func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
 		return "", fmt.Errorf("invalid issuer URL: %w", err)
 	}
 
-	// RFC 8414 Section 2: issuer must use https scheme
-	if parsed.Scheme != "https" {
+	// RFC 8414 Section 2 requires HTTPS. Local development can explicitly
+	// opt into insecure remote URLs to exercise HTTP-only OAuth providers.
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && (scheme != "http" || !allowInsecureRemoteURLs()) {
 		return "", fmt.Errorf("issuer URL must use https scheme")
 	}
 
@@ -301,8 +307,8 @@ func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
 		path = ""
 	}
 
-	return fmt.Sprintf("https://%s/.well-known/oauth-authorization-server%s",
-		host, path), nil
+	return fmt.Sprintf("%s://%s/.well-known/oauth-authorization-server%s",
+		scheme, host, path), nil
 }
 
 // fetchAuthorizationServerMetadata fetches metadata from /.well-known/oauth-authorization-server
