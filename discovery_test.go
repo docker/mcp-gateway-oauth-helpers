@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -61,11 +62,11 @@ func TestDiscoveryFallback_NoWWWAuthenticate(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if r.URL.Path == "/.well-known/oauth-protected-resource" {
+		if r.URL.Path == "/.well-known/oauth-protected-resource/mcp" {
 			// Provide resource metadata at well-known endpoint
 			baseURL := "https://" + r.Host
 			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
-				Resource:            baseURL,
+				Resource:            baseURL + "/mcp",
 				AuthorizationServer: authServer.URL, // httptest.NewTLSServer URL is already https
 			})
 			return
@@ -125,23 +126,21 @@ func TestDiscoveryHappyPath_WithWWWAuthenticate(t *testing.T) {
 	}))
 	defer authServer.Close()
 
-	// Mock metadata server (separate from MCP server) - TLS
-	metadataServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
-			Resource:            "https://api.example.com",
-			AuthorizationServer: authServer.URL,
-			Scopes:              []string{"read", "write"},
-		})
-	}))
-	defer metadataServer.Close()
-
 	// Mock MCP server (returns 401 WITH WWW-Authenticate) - TLS
 	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseURL := "https://" + r.Host
 		if r.URL.Path == "/mcp" {
 			// Return 401 WITH WWW-Authenticate header (standard MCP behavior)
-			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer realm=\"test\", resource_metadata=\"%s\"", metadataServer.URL))
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer realm=\"test\", resource_metadata=\"%s/oauth-metadata\"", baseURL))
 			w.WriteHeader(http.StatusUnauthorized)
 			return
+		}
+		if r.URL.Path == "/oauth-metadata" {
+			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
+				Resource:            baseURL + "/mcp",
+				AuthorizationServer: authServer.URL,
+				Scopes:              []string{"read", "write"},
+			})
 		}
 	}))
 	defer mcpServer.Close()
@@ -172,6 +171,9 @@ func TestDiscoveryHappyPath_WithWWWAuthenticate(t *testing.T) {
 	if len(discovery.Scopes) != 2 {
 		t.Errorf("Expected 2 scopes from metadata, got %d", len(discovery.Scopes))
 	}
+	if discovery.ResourceURL != mcpServer.URL+"/mcp" {
+		t.Errorf("Expected ResourceURL=%s, got %s", mcpServer.URL+"/mcp", discovery.ResourceURL)
+	}
 }
 
 // TestDiscoveryError_AuthServerFails verifies error handling
@@ -186,11 +188,11 @@ func TestDiscoveryError_AuthServerFails(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if r.URL.Path == "/.well-known/oauth-protected-resource" {
+		if r.URL.Path == "/.well-known/oauth-protected-resource/mcp" {
 			// Return resource metadata pointing to non-existent auth server
 			baseURL := "https://" + r.Host
 			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
-				Resource:            baseURL,
+				Resource:            baseURL + "/mcp",
 				AuthorizationServer: "https://localhost:99999", // Invalid/unreachable
 			})
 			return
@@ -210,6 +212,189 @@ func TestDiscoveryError_AuthServerFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "fetching authorization server metadata") {
 		t.Errorf("Expected auth server error, got: %v", err)
+	}
+}
+
+func TestDiscoveryRejectsCrossOriginResourceMetadataBeforeFetch(t *testing.T) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	var metadataCalled atomic.Bool
+	metadataServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		metadataCalled.Store(true)
+	}))
+	defer metadataServer.Close()
+
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mcp" {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/metadata\"", metadataServer.URL))
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer mcpServer.Close()
+
+	_, err := DiscoverOAuthRequirements(context.Background(), mcpServer.URL+"/mcp")
+	if err == nil || !strings.Contains(err.Error(), "must use the same origin") {
+		t.Fatalf("expected same-origin validation error, got %v", err)
+	}
+	if metadataCalled.Load() {
+		t.Fatal("cross-origin resource metadata endpoint must not be fetched")
+	}
+}
+
+func TestDiscoveryRejectsCrossOriginResourceMetadataRedirect(t *testing.T) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	var redirectTargetCalled atomic.Bool
+	redirectTarget := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirectTargetCalled.Store(true)
+	}))
+	defer redirectTarget.Close()
+
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseURL := "https://" + r.Host
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/metadata\"", baseURL))
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/metadata":
+			http.Redirect(w, r, redirectTarget.URL+"/captured", http.StatusFound)
+		}
+	}))
+	defer mcpServer.Close()
+
+	_, err := DiscoverOAuthRequirements(context.Background(), mcpServer.URL+"/mcp")
+	if err == nil || !strings.Contains(err.Error(), "must use the same origin") {
+		t.Fatalf("expected redirected metadata origin error, got %v", err)
+	}
+	if redirectTargetCalled.Load() {
+		t.Fatal("cross-origin resource metadata redirect target must not be fetched")
+	}
+}
+
+func TestDiscoveryRejectsMismatchedProtectedResource(t *testing.T) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseURL := "https://" + r.Host
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/metadata\"", baseURL))
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/metadata":
+			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
+				Resource:            baseURL + "/other",
+				AuthorizationServer: "https://auth.example.com",
+			})
+		}
+	}))
+	defer mcpServer.Close()
+
+	_, err := DiscoverOAuthRequirements(context.Background(), mcpServer.URL+"/mcp")
+	if err == nil || !strings.Contains(err.Error(), "does not match requested resource") {
+		t.Fatalf("expected protected resource mismatch error, got %v", err)
+	}
+}
+
+func TestFetchAuthorizationServerMetadataRejectsIssuerMismatch(t *testing.T) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseURL := "https://" + r.Host
+		_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
+			Issuer:                baseURL + "/",
+			AuthorizationEndpoint: baseURL + "/authorize",
+			TokenEndpoint:         baseURL + "/token",
+		})
+	}))
+	defer authServer.Close()
+
+	_, err := fetchAuthorizationServerMetadata(context.Background(), httpClientFunc(), authServer.URL)
+	if err == nil || !strings.Contains(err.Error(), "does not match requested issuer") {
+		t.Fatalf("expected exact issuer mismatch error, got %v", err)
+	}
+}
+
+func TestBuildRFC9728WellKnownURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		resource string
+		expected string
+		wantErr  bool
+	}{
+		{
+			name:     "origin resource",
+			resource: "https://example.com",
+			expected: "https://example.com/.well-known/oauth-protected-resource",
+		},
+		{
+			name:     "path and query",
+			resource: "https://EXAMPLE.COM/mcp%20server?tenant=one",
+			expected: "https://example.com/.well-known/oauth-protected-resource/mcp%20server?tenant=one",
+		},
+		{
+			name:     "root path",
+			resource: "https://example.com/",
+			expected: "https://example.com/.well-known/oauth-protected-resource",
+		},
+		{
+			name:     "fragment rejected",
+			resource: "https://example.com/mcp#fragment",
+			wantErr:  true,
+		},
+		{
+			name:     "relative URL rejected",
+			resource: "/mcp",
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := buildRFC9728WellKnownURL(tt.resource)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tt.resource)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actual != tt.expected {
+				t.Errorf("buildRFC9728WellKnownURL(%q) = %q, want %q", tt.resource, actual, tt.expected)
+			}
+		})
+	}
+}
+
+func TestValidateSameOrigin(t *testing.T) {
+	tests := []struct {
+		name        string
+		serverURL   string
+		metadataURL string
+		wantErr     bool
+	}{
+		{name: "same origin", serverURL: "https://EXAMPLE.com/mcp", metadataURL: "https://example.COM/metadata"},
+		{name: "equivalent default port", serverURL: "https://example.com/mcp", metadataURL: "https://example.com:443/metadata"},
+		{name: "sibling host", serverURL: "https://mcp.example.com/mcp", metadataURL: "https://metadata.example.com/metadata", wantErr: true},
+		{name: "different scheme", serverURL: "https://example.com/mcp", metadataURL: "http://example.com/metadata", wantErr: true},
+		{name: "different port", serverURL: "https://example.com/mcp", metadataURL: "https://example.com:8443/metadata", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSameOrigin(tt.serverURL, tt.metadataURL)
+			if tt.wantErr && err == nil {
+				t.Fatal("expected origin mismatch")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected origin error: %v", err)
+			}
+		})
 	}
 }
 
