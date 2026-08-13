@@ -12,6 +12,17 @@ This library provides the core OAuth/DCR functions for MCP Gateway:
 - **Dynamic Client Registration**: Register OAuth clients automatically (RFC 7591)
 - **WWW-Authenticate Parsing**: Parse OAuth challenge headers
 
+## Local development
+
+OAuth discovery allows only public HTTPS authorization servers by default. It
+rejects localhost, private, link-local, and reserved destinations before
+dialing, including redirect targets.
+
+For local development with an HTTP or private-network OAuth provider, set
+`DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS=1`. This disables the authorization
+server network guard and HTTPS requirement, so it must not be enabled with
+untrusted MCP servers.
+
 ## Configuring redirect URI validation
 
 By default DCR only accepts redirect URI hosts for localhost, `mcp.docker.com`, and `mcp-stage.docker.com`.

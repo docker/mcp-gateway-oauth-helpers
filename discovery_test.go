@@ -223,6 +223,8 @@ func TestDiscoveryError_AuthServerFails(t *testing.T) {
 }
 
 func TestDiscoveryRejectsPrivateAuthorizationServerBeforeFetch(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
 	original := httpClientFunc
 	defer func() { httpClientFunc = original }()
 
@@ -266,6 +268,42 @@ func TestDiscoveryRejectsPrivateAuthorizationServerBeforeFetch(t *testing.T) {
 	}
 }
 
+func TestDiscoveryAllowsLocalHTTPAuthorizationServerWithOptIn(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "1")
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/metadata\"", server.URL))
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/metadata":
+			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
+				Resource:            server.URL + "/mcp",
+				AuthorizationServer: server.URL,
+			})
+		case "/.well-known/oauth-authorization-server":
+			_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
+				Issuer:                server.URL,
+				AuthorizationEndpoint: server.URL + "/authorize",
+				TokenEndpoint:         server.URL + "/token",
+			})
+		}
+	}))
+	defer server.Close()
+
+	discovery, err := DiscoverOAuthRequirements(context.Background(), server.URL+"/mcp")
+	if err != nil {
+		t.Fatalf("discovering local OAuth server: %v", err)
+	}
+	if discovery.AuthorizationServer != server.URL {
+		t.Fatalf("expected authorization server %q, got %q", server.URL, discovery.AuthorizationServer)
+	}
+	if discovery.TokenEndpoint != server.URL+"/token" {
+		t.Fatalf("expected token endpoint %q, got %q", server.URL+"/token", discovery.TokenEndpoint)
+	}
+}
+
 type staticResolver map[string][]netip.Addr
 
 func (r staticResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
@@ -273,6 +311,8 @@ func (r staticResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.
 }
 
 func TestAuthorizationServerClientRejectsPrivateDNSResultBeforeDial(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
 	var dialed atomic.Bool
 	baseClient := &http.Client{
 		Transport: &http.Transport{
@@ -302,7 +342,39 @@ func TestAuthorizationServerClientRejectsPrivateDNSResultBeforeDial(t *testing.T
 	}
 }
 
+func TestAuthorizationServerClientRejectsLocalhostByDefault(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	var dialed atomic.Bool
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				dialed.Store(true)
+				return nil, fmt.Errorf("unexpected dial")
+			},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(baseClient, staticResolver{})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://localhost/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	_, err = client.Do(req)
+	if err == nil || !strings.Contains(err.Error(), "host \"localhost\" is not allowed") {
+		t.Fatalf("expected localhost rejection, got %v", err)
+	}
+	if dialed.Load() {
+		t.Fatal("localhost must be rejected before dialing")
+	}
+}
+
 func TestAuthorizationServerClientRejectsRedirectToPrivateAddress(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
 	var dialCount atomic.Int32
 	var dialedAddress string
 	redirector := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -529,6 +601,8 @@ func TestValidateSameOrigin(t *testing.T) {
 
 // TestBuildRFC8414WellKnownURL verifies RFC 8414 Section 3.1 URL construction
 func TestBuildRFC8414WellKnownURL(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
 	tests := []struct {
 		name     string
 		issuer   string

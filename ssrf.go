@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 )
+
+const allowInsecureRemoteURLEnv = "DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS"
 
 type ipResolver interface {
 	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
@@ -27,6 +30,10 @@ func newAuthorizationServerHTTPClient(client *http.Client) (*http.Client, error)
 func newAuthorizationServerHTTPClientWithResolver(client *http.Client, resolver ipResolver) (*http.Client, error) {
 	if client == nil {
 		return nil, fmt.Errorf("HTTP client is nil")
+	}
+	if allowInsecureRemoteURLs() {
+		insecureClient := *client
+		return &insecureClient, nil
 	}
 	if resolver == nil {
 		return nil, fmt.Errorf("IP resolver is nil")
@@ -165,6 +172,11 @@ func isBlockedHostname(host string) bool {
 		}
 	}
 	return false
+}
+
+func allowInsecureRemoteURLs() bool {
+	value := os.Getenv(allowInsecureRemoteURLEnv)
+	return value == "1" || strings.EqualFold(value, "true")
 }
 
 var blockedPrefixes = []netip.Prefix{

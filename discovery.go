@@ -280,8 +280,10 @@ func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
 		return "", fmt.Errorf("invalid issuer URL: %w", err)
 	}
 
-	// RFC 8414 Section 2: issuer must use https scheme
-	if parsed.Scheme != "https" {
+	// RFC 8414 Section 2 requires HTTPS. Local development can explicitly
+	// opt into insecure remote URLs to exercise HTTP-only OAuth providers.
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && (scheme != "http" || !allowInsecureRemoteURLs()) {
 		return "", fmt.Errorf("issuer URL must use https scheme")
 	}
 
@@ -305,8 +307,8 @@ func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
 		path = ""
 	}
 
-	return fmt.Sprintf("https://%s/.well-known/oauth-authorization-server%s",
-		host, path), nil
+	return fmt.Sprintf("%s://%s/.well-known/oauth-authorization-server%s",
+		scheme, host, path), nil
 }
 
 // fetchAuthorizationServerMetadata fetches metadata from /.well-known/oauth-authorization-server
