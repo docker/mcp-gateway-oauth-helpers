@@ -5,8 +5,10 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +17,7 @@ import (
 // setupTestHTTPClient configures httpClientFunc to accept test TLS certificates
 func setupTestHTTPClient(_ *testing.T) func() {
 	original := httpClientFunc
+	originalAuthorizationServerClientFunc := authorizationServerHTTPClientFunc
 	httpClientFunc = func() *http.Client {
 		return &http.Client{
 			Transport: &http.Transport{
@@ -22,8 +25,12 @@ func setupTestHTTPClient(_ *testing.T) func() {
 			},
 		}
 	}
+	authorizationServerHTTPClientFunc = func(client *http.Client) (*http.Client, error) {
+		return client, nil
+	}
 	return func() {
 		httpClientFunc = original
+		authorizationServerHTTPClientFunc = originalAuthorizationServerClientFunc
 	}
 }
 
@@ -212,6 +219,128 @@ func TestDiscoveryError_AuthServerFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "fetching authorization server metadata") {
 		t.Errorf("Expected auth server error, got: %v", err)
+	}
+}
+
+func TestDiscoveryRejectsPrivateAuthorizationServerBeforeFetch(t *testing.T) {
+	original := httpClientFunc
+	defer func() { httpClientFunc = original }()
+
+	var privateDialed atomic.Bool
+	dialer := &net.Dialer{}
+	httpClientFunc = func() *http.Client {
+		return &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+					if strings.HasPrefix(address, "169.254.169.254:") {
+						privateDialed.Store(true)
+					}
+					return dialer.DialContext(ctx, network, address)
+				},
+			},
+		}
+	}
+
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseURL := "https://" + r.Host
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/metadata\"", baseURL))
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/metadata":
+			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
+				Resource:            baseURL + "/mcp",
+				AuthorizationServer: "https://169.254.169.254/latest/meta-data",
+			})
+		}
+	}))
+	defer mcpServer.Close()
+
+	_, err := DiscoverOAuthRequirements(context.Background(), mcpServer.URL+"/mcp")
+	if err == nil || !strings.Contains(err.Error(), "blocked range 169.254.0.0/16") {
+		t.Fatalf("expected private authorization server rejection, got %v", err)
+	}
+	if privateDialed.Load() {
+		t.Fatal("private authorization server must be rejected before dialing")
+	}
+}
+
+type staticResolver map[string][]netip.Addr
+
+func (r staticResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	return r[host], nil
+}
+
+func TestAuthorizationServerClientRejectsPrivateDNSResultBeforeDial(t *testing.T) {
+	var dialed atomic.Bool
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				dialed.Store(true)
+				return nil, fmt.Errorf("unexpected dial")
+			},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(baseClient, staticResolver{
+		"auth.example.com": {netip.MustParseAddr("10.0.0.1")},
+	})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	_, err = client.Do(req)
+	if err == nil || !strings.Contains(err.Error(), "blocked range 10.0.0.0/8") {
+		t.Fatalf("expected private DNS result rejection, got %v", err)
+	}
+	if dialed.Load() {
+		t.Fatal("private DNS result must be rejected before dialing")
+	}
+}
+
+func TestAuthorizationServerClientRejectsRedirectToPrivateAddress(t *testing.T) {
+	var dialCount atomic.Int32
+	var dialedAddress string
+	redirector := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://169.254.169.254/latest/meta-data", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	dialer := &net.Dialer{}
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				dialCount.Add(1)
+				dialedAddress = address
+				return dialer.DialContext(ctx, network, redirector.Listener.Addr().String())
+			},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(baseClient, staticResolver{
+		"auth.example.com": {netip.MustParseAddr("93.184.216.34")},
+	})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	_, err = client.Do(req)
+	if err == nil || !strings.Contains(err.Error(), "blocked range 169.254.0.0/16") {
+		t.Fatalf("expected private redirect rejection, got %v", err)
+	}
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("expected only the public redirector to be dialed, got %d dials", got)
+	}
+	if dialedAddress != "93.184.216.34:443" {
+		t.Fatalf("expected the validated public IP to be pinned, got %q", dialedAddress)
 	}
 }
 
