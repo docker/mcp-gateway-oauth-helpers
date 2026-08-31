@@ -377,10 +377,35 @@ func fetchAuthorizationServerMetadata(ctx context.Context, client *http.Client, 
 }
 
 func validateProtectedResource(expected, actual string) error {
-	if actual != expected {
-		return fmt.Errorf("protected resource metadata resource %q does not match requested resource %q", actual, expected)
+	if actual == expected {
+		return nil
 	}
-	return nil
+	if resourceNamesOrigin(actual, expected) {
+		return nil
+	}
+	return fmt.Errorf("protected resource metadata resource %q does not match requested resource %q", actual, expected)
+}
+
+// resourceNamesOrigin reports whether actual names exactly the origin
+// (scheme + host, no path/query/fragment) of expected, which itself has a
+// path. RFC 8707 resource indicators identify a resource server rather than
+// echo a request URL verbatim, and some resource servers legitimately publish
+// themselves at origin granularity even though a given MCP endpoint has a
+// path (e.g. Slack's protected-resource document names "https://mcp.slack.com"
+// for its "https://mcp.slack.com/mcp" endpoint). A document naming any other
+// path is still rejected by the exact-match check above.
+func resourceNamesOrigin(actual, expected string) bool {
+	a, err := url.Parse(actual)
+	if err != nil {
+		return false
+	}
+	e, err := url.Parse(expected)
+	if err != nil {
+		return false
+	}
+	return e.Path != "" &&
+		a.Path == "" && a.RawQuery == "" && a.Fragment == "" &&
+		strings.EqualFold(a.Scheme, e.Scheme) && strings.EqualFold(a.Host, e.Host)
 }
 
 func validateSameOrigin(serverURL, metadataURL string) error {

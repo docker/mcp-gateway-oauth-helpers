@@ -499,6 +499,56 @@ func TestDiscoveryRejectsMismatchedProtectedResource(t *testing.T) {
 	}
 }
 
+// TestDiscoveryAllowsOriginProtectedResourceForPathBearingEndpoint guards a
+// real-world shape: a resource server publishes its protected-resource
+// document with a bare-origin `resource` (no path) even though the MCP
+// endpoint being discovered has a path. Slack's MCP server does exactly this
+// (resource "https://mcp.slack.com" for endpoint
+// "https://mcp.slack.com/mcp"). RFC 8707 resource indicators identify a
+// resource server rather than echo the request URL verbatim, so this must
+// succeed rather than fail as a mismatch — only a metadata resource naming
+// some OTHER path (TestDiscoveryRejectsMismatchedProtectedResource) is
+// rejected.
+func TestDiscoveryAllowsOriginProtectedResourceForPathBearingEndpoint(t *testing.T) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/.well-known/oauth-authorization-server") {
+			baseURL := "https://" + r.Host
+			_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
+				Issuer:                baseURL,
+				AuthorizationEndpoint: baseURL + "/authorize",
+				TokenEndpoint:         baseURL + "/token",
+			})
+		}
+	}))
+	defer authServer.Close()
+
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseURL := "https://" + r.Host
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/metadata\"", baseURL))
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/metadata":
+			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
+				Resource:            baseURL,
+				AuthorizationServer: authServer.URL,
+			})
+		}
+	}))
+	defer mcpServer.Close()
+
+	discovery, err := DiscoverOAuthRequirements(context.Background(), mcpServer.URL+"/mcp")
+	if err != nil {
+		t.Fatalf("expected origin-only protected resource to be accepted, got error: %v", err)
+	}
+	if !discovery.RequiresOAuth {
+		t.Error("expected RequiresOAuth=true")
+	}
+}
+
 func TestFetchAuthorizationServerMetadataRejectsIssuerMismatch(t *testing.T) {
 	cleanup := setupTestHTTPClient(t)
 	defer cleanup()
