@@ -157,11 +157,10 @@ func normalizeHostname(host string) string {
 func isBlockedHostname(host string) bool {
 	host = normalizeHostname(host)
 	switch host {
-	case "localhost", "metadata", "metadata.google.internal", "metadata.azure.internal":
+	case "metadata", "metadata.google.internal", "metadata.azure.internal":
 		return true
 	}
 	for _, suffix := range []string{
-		".localhost",
 		".local",
 		".localdomain",
 		".internal",
@@ -184,7 +183,6 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("10.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("127.0.0.0/8"),
 	netip.MustParsePrefix("169.254.0.0/16"),
 	netip.MustParsePrefix("172.16.0.0/12"),
 	netip.MustParsePrefix("192.0.0.0/24"),
@@ -197,7 +195,6 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),
 	netip.MustParsePrefix("255.255.255.255/32"),
 	netip.MustParsePrefix("::/128"),
-	netip.MustParsePrefix("::1/128"),
 	netip.MustParsePrefix("64:ff9b::/96"),
 	netip.MustParsePrefix("fc00::/7"),
 	netip.MustParsePrefix("fe80::/10"),
@@ -214,6 +211,9 @@ func validatePublicAddr(ip netip.Addr) error {
 	}
 
 	ip = ip.Unmap()
+	if ip.IsLoopback() {
+		return nil
+	}
 	for _, prefix := range blockedPrefixes {
 		if prefix.Contains(ip) {
 			return fmt.Errorf("address is in blocked range %s", prefix)
