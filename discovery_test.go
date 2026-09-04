@@ -446,7 +446,7 @@ func TestAuthorizationServerClientAllowsLoopbackIPLiteralByDefault(t *testing.T)
 func TestAuthorizationServerClientAllowsPublicHTTPByDefault(t *testing.T) {
 	t.Setenv(allowInsecureRemoteURLEnv, "")
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
 			Issuer:                "http://auth.example.com",
 			AuthorizationEndpoint: "http://auth.example.com/authorize",
