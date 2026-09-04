@@ -14,14 +14,15 @@ This library provides the core OAuth/DCR functions for MCP Gateway:
 
 ## Local development
 
-OAuth discovery allows only public HTTPS authorization servers by default. It
-rejects localhost, private, link-local, and reserved destinations before
-dialing, including redirect targets.
+OAuth discovery allows public HTTP and HTTPS authorization servers by
+default. It rejects localhost, private, link-local, and reserved
+destinations before dialing, including redirect targets, regardless of
+scheme.
 
-For local development with an HTTP or private-network OAuth provider, set
-`DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS=1`. This disables the authorization
-server network guard and HTTPS requirement, so it must not be enabled with
-untrusted MCP servers.
+For local development with a private-network or localhost OAuth provider,
+set `DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS=1`. This disables the
+authorization server network guard (the localhost/private/link-local
+address checks), so it must not be enabled with untrusted MCP servers.
 
 ## Configuring redirect URI validation
 

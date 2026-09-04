@@ -342,6 +342,79 @@ func TestAuthorizationServerClientRejectsPrivateDNSResultBeforeDial(t *testing.T
 	}
 }
 
+func TestAuthorizationServerClientAllowsPublicHTTPByDefault(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
+			Issuer:                "http://auth.example.com",
+			AuthorizationEndpoint: "http://auth.example.com/authorize",
+			TokenEndpoint:         "http://auth.example.com/token",
+		})
+	}))
+	defer server.Close()
+
+	dialer := &net.Dialer{}
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return dialer.DialContext(ctx, network, server.Listener.Addr().String())
+			},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(baseClient, staticResolver{
+		"auth.example.com": {netip.MustParseAddr("93.184.216.34")},
+	})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expected http authorization server request to succeed by default, got %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestAuthorizationServerClientRejectsPrivateDNSResultBeforeDialForHTTP(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	var dialed atomic.Bool
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				dialed.Store(true)
+				return nil, fmt.Errorf("unexpected dial")
+			},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(baseClient, staticResolver{
+		"auth.example.com": {netip.MustParseAddr("10.0.0.1")},
+	})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	_, err = client.Do(req)
+	if err == nil || !strings.Contains(err.Error(), "blocked range 10.0.0.0/8") {
+		t.Fatalf("expected private DNS result rejection for http scheme, got %v", err)
+	}
+	if dialed.Load() {
+		t.Fatal("private DNS result must be rejected before dialing regardless of scheme")
+	}
+}
+
 func TestAuthorizationServerClientRejectsLocalhostByDefault(t *testing.T) {
 	t.Setenv(allowInsecureRemoteURLEnv, "")
 
@@ -682,10 +755,15 @@ func TestBuildRFC8414WellKnownURL(t *testing.T) {
 			errMsg:  "invalid issuer URL",
 		},
 		{
-			name:    "http scheme rejected (RFC 8414 requires https)",
-			issuer:  "http://example.com",
+			name:     "http scheme allowed",
+			issuer:   "http://example.com",
+			expected: "http://example.com/.well-known/oauth-authorization-server",
+		},
+		{
+			name:    "non-http(s) scheme rejected",
+			issuer:  "ftp://example.com",
 			wantErr: true,
-			errMsg:  "must use https scheme",
+			errMsg:  "must use http or https scheme",
 		},
 		{
 			name:    "query parameters rejected (RFC 8414 Section 2)",

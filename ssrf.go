@@ -20,9 +20,10 @@ type ipResolver interface {
 var authorizationServerHTTPClientFunc = newAuthorizationServerHTTPClient
 
 // newAuthorizationServerHTTPClient limits attacker-influenced authorization
-// server metadata requests to public HTTPS destinations. It resolves and pins
-// the address at dial time so DNS rebinding cannot redirect the connection to
-// a private service. The guarded transport is also used for every redirect.
+// server metadata requests to public HTTP(S) destinations. It resolves and
+// pins the address at dial time so DNS rebinding cannot redirect the
+// connection to a private service. The guarded transport is also used for
+// every redirect.
 func newAuthorizationServerHTTPClient(client *http.Client) (*http.Client, error) {
 	return newAuthorizationServerHTTPClientWithResolver(client, net.DefaultResolver)
 }
@@ -80,18 +81,18 @@ type publicOnlyRoundTripper struct {
 }
 
 func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := validatePublicHTTPSURL(req.URL); err != nil {
+	if err := validatePublicAuthServerURL(req.URL); err != nil {
 		return nil, err
 	}
 	return t.base.RoundTrip(req)
 }
 
-func validatePublicHTTPSURL(target *url.URL) error {
+func validatePublicAuthServerURL(target *url.URL) error {
 	if target == nil || target.Scheme == "" || target.Host == "" {
 		return fmt.Errorf("authorization server URL must be absolute")
 	}
-	if !strings.EqualFold(target.Scheme, "https") {
-		return fmt.Errorf("authorization server URL must use https")
+	if !strings.EqualFold(target.Scheme, "https") && !strings.EqualFold(target.Scheme, "http") {
+		return fmt.Errorf("authorization server URL must use http or https")
 	}
 	if target.User != nil {
 		return fmt.Errorf("authorization server URL must not include userinfo")
