@@ -342,6 +342,50 @@ func TestAuthorizationServerClientRejectsPrivateDNSResultBeforeDial(t *testing.T
 	}
 }
 
+// TestAuthorizationServerClientRejectsInternalCorporateHostname reproduces a
+// reported discovery failure against an internal/corporate authorization
+// server hostname (dp.mcpgw-prod.us-east-1.800960612025.docker.team) that
+// resolves, via split-horizon/VPN-scoped internal DNS, to a private RFC1918
+// address (10.204.1.251). It confirms the guard's dial-time DNS check
+// (dialPublicAddress in ssrf.go) rejects the resolved address with the same
+// "blocked range 10.0.0.0/8" error reported in the field, before any dial is
+// attempted. This demonstrates the guard's existing, intended behavior; it
+// does not weaken or remove it.
+func TestAuthorizationServerClientRejectsInternalCorporateHostname(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	const internalHost = "dp.mcpgw-prod.us-east-1.800960612025.docker.team"
+
+	var dialed atomic.Bool
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				dialed.Store(true)
+				return nil, fmt.Errorf("unexpected dial")
+			},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(baseClient, staticResolver{
+		internalHost: {netip.MustParseAddr("10.204.1.251")},
+	})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+internalHost+"/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	_, err = client.Do(req)
+	wantErr := fmt.Sprintf("authorization server host %q resolved to disallowed address 10.204.1.251: address is in blocked range 10.0.0.0/8", internalHost)
+	if err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Fatalf("expected internal corporate hostname rejection %q, got %v", wantErr, err)
+	}
+	if dialed.Load() {
+		t.Fatal("private DNS result must be rejected before dialing")
+	}
+}
+
 func TestAuthorizationServerClientRejectsLocalhostByDefault(t *testing.T) {
 	t.Setenv(allowInsecureRemoteURLEnv, "")
 
