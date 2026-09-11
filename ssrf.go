@@ -17,21 +17,44 @@ type ipResolver interface {
 	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
 }
 
-var authorizationServerHTTPClientFunc = newAuthorizationServerHTTPClient
+// skipSSRFCheckKey is deliberately its own type (not log.go's contextKey) so
+// that it can never collide with a value stored under another package key.
+type skipSSRFCheckKey struct{}
 
-// newAuthorizationServerHTTPClient limits attacker-influenced authorization
-// server metadata requests to public HTTPS destinations. It resolves and pins
-// the address at dial time so DNS rebinding cannot redirect the connection to
-// a private service. The guarded transport is also used for every redirect.
-func newAuthorizationServerHTTPClient(client *http.Client) (*http.Client, error) {
-	return newAuthorizationServerHTTPClientWithResolver(client, net.DefaultResolver)
+// WithSkipSSRFCheck opts a single DiscoverOAuthRequirements call out of the
+// authorization-server SSRF guard entirely. Unlike the default warn-and-
+// proceed posture (see newAuthorizationServerHTTPClientWithResolver), this
+// turns the check fully off for the call carrying this context: no scheme,
+// hostname, or address checks, no dial-time pinning, and no warning log.
+// This mirrors allowInsecureRemoteURLEnv but is scoped to one call instead
+// of the whole process.
+func WithSkipSSRFCheck(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipSSRFCheckKey{}, true)
 }
 
-func newAuthorizationServerHTTPClientWithResolver(client *http.Client, resolver ipResolver) (*http.Client, error) {
+func skipSSRFCheck(ctx context.Context) bool {
+	skip, _ := ctx.Value(skipSSRFCheckKey{}).(bool)
+	return skip
+}
+
+var authorizationServerHTTPClientFunc = newAuthorizationServerHTTPClient
+
+// newAuthorizationServerHTTPClient by default resolves and pins the
+// authorization server address at dial time so DNS rebinding cannot redirect
+// the connection to a private service, but it never blocks the request: a
+// rejection is logged as a warning (naming the address) and the same request
+// proceeds anyway, unless the context carries WithSkipSSRFCheck, in which
+// case the check is skipped entirely (no checks, no warning). The guarded
+// transport is also used for every redirect.
+func newAuthorizationServerHTTPClient(ctx context.Context, client *http.Client) (*http.Client, error) {
+	return newAuthorizationServerHTTPClientWithResolver(ctx, client, net.DefaultResolver)
+}
+
+func newAuthorizationServerHTTPClientWithResolver(ctx context.Context, client *http.Client, resolver ipResolver) (*http.Client, error) {
 	if client == nil {
 		return nil, fmt.Errorf("HTTP client is nil")
 	}
-	if allowInsecureRemoteURLs() {
+	if allowInsecureRemoteURLs() || skipSSRFCheck(ctx) {
 		insecureClient := *client
 		return &insecureClient, nil
 	}
@@ -80,47 +103,65 @@ type publicOnlyRoundTripper struct {
 }
 
 func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := validatePublicHTTPSURL(req.URL); err != nil {
+	ssrfErr, err := validatePublicHTTPSURL(req.URL)
+	if err != nil {
 		return nil, err
+	}
+	if ssrfErr != nil {
+		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %v", req.URL, ssrfErr)
 	}
 	return t.base.RoundTrip(req)
 }
 
-func validatePublicHTTPSURL(target *url.URL) error {
+// validatePublicHTTPSURL enforces the always-hard requirements for an
+// authorization server URL (absolute, https scheme, no userinfo, well-formed
+// host) via hardErr. It separately reports, via ssrfErr, whether the host is
+// blocked by the SSRF guard (a known-private hostname, or a literal IP in a
+// private/loopback/link-local/metadata/reserved range). Callers treat
+// ssrfErr as warn-and-continue and hardErr as a genuine failure.
+func validatePublicHTTPSURL(target *url.URL) (ssrfErr, hardErr error) {
 	if target == nil || target.Scheme == "" || target.Host == "" {
-		return fmt.Errorf("authorization server URL must be absolute")
+		return nil, fmt.Errorf("authorization server URL must be absolute")
 	}
 	if !strings.EqualFold(target.Scheme, "https") {
-		return fmt.Errorf("authorization server URL must use https")
+		return nil, fmt.Errorf("authorization server URL must use https")
 	}
 	if target.User != nil {
-		return fmt.Errorf("authorization server URL must not include userinfo")
+		return nil, fmt.Errorf("authorization server URL must not include userinfo")
 	}
 
 	host := normalizeHostname(target.Hostname())
 	if host == "" || strings.ContainsAny(host, "\x00%") {
-		return fmt.Errorf("authorization server URL host is malformed")
+		return nil, fmt.Errorf("authorization server URL host is malformed")
 	}
 	if isBlockedHostname(host) {
-		return fmt.Errorf("authorization server URL host %q is not allowed", host)
+		return fmt.Errorf("authorization server URL host %q is not allowed", host), nil
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if err := validatePublicAddr(ip); err != nil {
-			return fmt.Errorf("authorization server URL host %q is not allowed: %w", host, err)
+			return fmt.Errorf("authorization server URL host %q is not allowed: %w", host, err), nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
+// dialPublicAddress pins the dial to the address(es) validated above,
+// closing the DNS-rebinding gap where a hostname could resolve differently
+// between the RoundTrip-time check and the actual dial. A disallowed address
+// is logged as a warning (naming the host/address) rather than rejected: the
+// dial proceeds against the real, rejected address exactly like every other
+// authorization-server SSRF rejection in this package.
 func dialPublicAddress(
 	ctx context.Context,
 	resolver ipResolver,
 	dial func(context.Context, string, string) (net.Conn, error),
 	network, host, port string,
 ) (net.Conn, error) {
+	logger := loggerFromContext(ctx)
+
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if err := validatePublicAddr(ip); err != nil {
-			return nil, err
+			logger.Warnf("authorization server dial address %s was rejected by the SSRF guard; dialing anyway: %v", ip, err)
 		}
 		return dial(ctx, network, net.JoinHostPort(ip.String(), port))
 	}
@@ -134,7 +175,7 @@ func dialPublicAddress(
 	}
 	for _, ip := range ips {
 		if err := validatePublicAddr(ip); err != nil {
-			return nil, fmt.Errorf("authorization server host %q resolved to disallowed address %s: %w", host, ip, err)
+			logger.Warnf("authorization server host %q resolved to disallowed address %s; dialing anyway: %v", host, ip, err)
 		}
 	}
 
