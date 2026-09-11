@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -146,7 +147,9 @@ func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		return nil, err
 	}
 	if ssrfErr != nil {
-		loggerFromContext(req.Context()).Warnf("authorization server request to %q was rejected by the SSRF guard; proceeding anyway: %q", req.URL.String(), ssrfErr.Error())
+		quotedURL := strconv.Quote(req.URL.String())
+		quotedErr := strconv.Quote(ssrfErr.Error())
+		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %s", quotedURL, quotedErr)
 	}
 	return t.base.RoundTrip(req)
 }
@@ -209,7 +212,9 @@ func dialPublicAddress(
 
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if err := validateDialAddr(ctx, ip); err != nil {
-			logger.Warnf("authorization server dial address %q was rejected by the SSRF guard; dialing anyway: %q", ip.String(), err.Error())
+			quotedIP := strconv.Quote(ip.String())
+			quotedErr := strconv.Quote(err.Error())
+			logger.Warnf("authorization server dial address %s was rejected by the SSRF guard; dialing anyway: %s", quotedIP, quotedErr)
 		}
 		return dial(ctx, network, net.JoinHostPort(ip.String(), port))
 	}
@@ -223,7 +228,10 @@ func dialPublicAddress(
 	}
 	for _, ip := range ips {
 		if err := validateDialAddr(ctx, ip); err != nil {
-			logger.Warnf("authorization server host %q resolved to disallowed address %q; dialing anyway: %q", host, ip.String(), err.Error())
+			quotedHost := strconv.Quote(host)
+			quotedIP := strconv.Quote(ip.String())
+			quotedErr := strconv.Quote(err.Error())
+			logger.Warnf("authorization server host %s resolved to disallowed address %s; dialing anyway: %s", quotedHost, quotedIP, quotedErr)
 		}
 	}
 
