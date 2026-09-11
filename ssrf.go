@@ -13,6 +13,16 @@ import (
 
 const allowInsecureRemoteURLEnv = "DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS"
 
+type skipSSRFCheckKey struct{}
+
+// WithSkipSSRFCheck disables the authorization-server metadata SSRF guard for
+// discovery using the returned context, including redirects. Use only when the
+// operator explicitly trusts the provider and its discovery destinations.
+// Other contexts and the process environment are unaffected.
+func WithSkipSSRFCheck(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipSSRFCheckKey{}, true)
+}
+
 type ipResolver interface {
 	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
 }

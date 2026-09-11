@@ -158,9 +158,12 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	// STEP 5: Fetch Authorization Server Metadata (REQUIRED)
 	// MCP Spec Section 3.1: "Authorization servers MUST provide OAuth 2.0 Authorization Server Metadata (RFC8414)"
 	logger.Infof("fetching authorization server metadata from: %s", authServerURL)
-	authServerClient, err := authorizationServerHTTPClientFunc(client)
-	if err != nil {
-		return nil, fmt.Errorf("securing authorization server metadata client: %w", err)
+	authServerClient := client
+	if skip, _ := ctx.Value(skipSSRFCheckKey{}).(bool); !skip {
+		authServerClient, err = authorizationServerHTTPClientFunc(client)
+		if err != nil {
+			return nil, fmt.Errorf("securing authorization server metadata client: %w", err)
+		}
 	}
 	authServerMetadata, err := fetchAuthorizationServerMetadata(ctx, authServerClient, authServerURL)
 	if err != nil {
