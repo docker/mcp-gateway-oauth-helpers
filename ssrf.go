@@ -174,7 +174,7 @@ func validatePublicHTTPSURL(ctx context.Context, target *url.URL) (ssrfErr, hard
 	allowLocal := allowLocalHTTP(ctx) && isLoopbackHost(host)
 
 	if !strings.EqualFold(target.Scheme, "https") {
-		if !(allowLocal && strings.EqualFold(target.Scheme, "http")) {
+		if !allowLocal || !strings.EqualFold(target.Scheme, "http") {
 			return nil, fmt.Errorf("authorization server URL must use https")
 		}
 	}

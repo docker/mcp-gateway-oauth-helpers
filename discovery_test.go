@@ -360,7 +360,7 @@ func TestDiscoveryRejectsPlainHTTPLoopbackAuthorizationServerByDefault(t *testin
 	cleanup := setupInsecureTLSClient(t)
 	defer cleanup()
 
-	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	authServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("authorization server should not be contacted when its scheme is hard-rejected")
 	}))
 	defer authServer.Close()
