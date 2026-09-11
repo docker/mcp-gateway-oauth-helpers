@@ -112,6 +112,40 @@ func TestDiscoveryFallback_NoWWWAuthenticate(t *testing.T) {
 	}
 }
 
+// TestDiscovery_NoAuthServer verifies that a remote MCP server requiring NO
+// OAuth — it does not return 401 and exposes no authorization server metadata —
+// is reported as RequiresOAuth=false rather than failing discovery.
+// Authorization is OPTIONAL per MCP spec Section 2.1, so no-auth servers are
+// valid; previously such a server failed with a fatal "fetching authorization
+// server metadata" error.
+func TestDiscovery_NoAuthServer(t *testing.T) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	// MCP server that needs no auth: 200 on the probe, 404 on the OAuth
+	// well-known endpoints (no authorization server metadata anywhere).
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mcp" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer mcpServer.Close()
+
+	logger := &testLogger{}
+	ctx := WithLogger(context.Background(), logger)
+
+	discovery, err := DiscoverOAuthRequirements(ctx, mcpServer.URL+"/mcp")
+	if err != nil {
+		t.Fatalf("Discovery should not fail for a no-auth server: %v", err)
+	}
+	if discovery.RequiresOAuth {
+		t.Error("Expected RequiresOAuth=false for a server that does not require OAuth")
+	}
+}
+
 // TestDiscoveryHappyPath_WithWWWAuthenticate verifies the standard flow
 // when server provides proper WWW-Authenticate header
 func TestDiscoveryHappyPath_WithWWWAuthenticate(t *testing.T) {
