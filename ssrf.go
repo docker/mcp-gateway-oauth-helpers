@@ -37,6 +37,44 @@ func skipSSRFCheck(ctx context.Context) bool {
 	return skip
 }
 
+// allowLocalHTTPKey is deliberately its own type (not log.go's contextKey or
+// skipSSRFCheckKey) so that it can never collide with a value stored under
+// another package key.
+type allowLocalHTTPKey struct{}
+
+// WithAllowLocalHTTP opts a single DiscoverOAuthRequirements call into
+// treating localhost/loopback (127.0.0.0/8, ::1, "localhost", "*.localhost")
+// as an allowed authorization server address, including over plain http.
+// It is deliberately narrower than WithSkipSSRFCheck: every other blocked
+// hostname suffix (.local, .internal, cloud-metadata hosts, etc.) and every
+// other blocked address range (RFC1918, link-local, etc.) is still subject
+// to the guard exactly as without this option. It answers "is this
+// destination local," not "is the guard on at all," so it does not imply
+// WithSkipSSRFCheck (or vice versa) — a caller may set either, both, or
+// neither.
+func WithAllowLocalHTTP(ctx context.Context) context.Context {
+	return context.WithValue(ctx, allowLocalHTTPKey{}, true)
+}
+
+func allowLocalHTTP(ctx context.Context) bool {
+	allow, _ := ctx.Value(allowLocalHTTPKey{}).(bool)
+	return allow
+}
+
+// isLoopbackHost reports whether a normalized hostname or textual IP literal
+// refers to localhost or a loopback address. It exists only to scope
+// WithAllowLocalHTTP's carve-out and must not be consulted anywhere the
+// guard's default posture applies.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap().IsLoopback()
+	}
+	return false
+}
+
 var authorizationServerHTTPClientFunc = newAuthorizationServerHTTPClient
 
 // newAuthorizationServerHTTPClient by default resolves and pins the
@@ -103,7 +141,7 @@ type publicOnlyRoundTripper struct {
 }
 
 func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	ssrfErr, err := validatePublicHTTPSURL(req.URL)
+	ssrfErr, err := validatePublicHTTPSURL(req.Context(), req.URL)
 	if err != nil {
 		return nil, err
 	}
@@ -114,17 +152,15 @@ func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 }
 
 // validatePublicHTTPSURL enforces the always-hard requirements for an
-// authorization server URL (absolute, https scheme, no userinfo, well-formed
+// authorization server URL (absolute, https scheme unless WithAllowLocalHTTP
+// permits http for this specific loopback host, no userinfo, well-formed
 // host) via hardErr. It separately reports, via ssrfErr, whether the host is
 // blocked by the SSRF guard (a known-private hostname, or a literal IP in a
 // private/loopback/link-local/metadata/reserved range). Callers treat
 // ssrfErr as warn-and-continue and hardErr as a genuine failure.
-func validatePublicHTTPSURL(target *url.URL) (ssrfErr, hardErr error) {
+func validatePublicHTTPSURL(ctx context.Context, target *url.URL) (ssrfErr, hardErr error) {
 	if target == nil || target.Scheme == "" || target.Host == "" {
 		return nil, fmt.Errorf("authorization server URL must be absolute")
-	}
-	if !strings.EqualFold(target.Scheme, "https") {
-		return nil, fmt.Errorf("authorization server URL must use https")
 	}
 	if target.User != nil {
 		return nil, fmt.Errorf("authorization server URL must not include userinfo")
@@ -133,6 +169,18 @@ func validatePublicHTTPSURL(target *url.URL) (ssrfErr, hardErr error) {
 	host := normalizeHostname(target.Hostname())
 	if host == "" || strings.ContainsAny(host, "\x00%") {
 		return nil, fmt.Errorf("authorization server URL host is malformed")
+	}
+
+	allowLocal := allowLocalHTTP(ctx) && isLoopbackHost(host)
+
+	if !strings.EqualFold(target.Scheme, "https") {
+		if !(allowLocal && strings.EqualFold(target.Scheme, "http")) {
+			return nil, fmt.Errorf("authorization server URL must use https")
+		}
+	}
+
+	if allowLocal {
+		return nil, nil
 	}
 	if isBlockedHostname(host) {
 		return fmt.Errorf("authorization server URL host %q is not allowed", host), nil
@@ -160,7 +208,7 @@ func dialPublicAddress(
 	logger := loggerFromContext(ctx)
 
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if err := validatePublicAddr(ip); err != nil {
+		if err := validateDialAddr(ctx, ip); err != nil {
 			logger.Warnf("authorization server dial address %s was rejected by the SSRF guard; dialing anyway: %v", ip, err)
 		}
 		return dial(ctx, network, net.JoinHostPort(ip.String(), port))
@@ -174,7 +222,7 @@ func dialPublicAddress(
 		return nil, fmt.Errorf("authorization server host %q did not resolve to any IP addresses", host)
 	}
 	for _, ip := range ips {
-		if err := validatePublicAddr(ip); err != nil {
+		if err := validateDialAddr(ctx, ip); err != nil {
 			logger.Warnf("authorization server host %q resolved to disallowed address %s; dialing anyway: %v", host, ip, err)
 		}
 	}
@@ -243,6 +291,16 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("fe80::/10"),
 	netip.MustParsePrefix("ff00::/8"),
 	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+// validateDialAddr is validatePublicAddr scoped by WithAllowLocalHTTP: a
+// loopback address is treated as allowed when the option is set on ctx,
+// otherwise it defers to validatePublicAddr unchanged.
+func validateDialAddr(ctx context.Context, ip netip.Addr) error {
+	if allowLocalHTTP(ctx) && ip.Unmap().IsLoopback() {
+		return nil
+	}
+	return validatePublicAddr(ip)
 }
 
 func validatePublicAddr(ip netip.Addr) error {

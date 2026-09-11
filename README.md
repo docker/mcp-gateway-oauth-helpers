@@ -32,8 +32,25 @@ opted a request out of the guard).
 `DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS=1` is unrelated and unaffected by the
 above: it still exists to relax the RFC 8414 HTTPS scheme requirement for
 local development with an HTTP OAuth provider, and continues to disable the
-authorization server network guard process-wide when set. Prefer
-`WithSkipSSRFCheck` for scoping an opt-out to a single call.
+authorization server network guard process-wide when set. Because it is
+process-wide and disables both the HTTPS requirement and the network guard
+entirely, it must not be enabled with untrusted MCP servers.
+
+For running a single MCP server on localhost during local development,
+`WithAllowLocalHTTP(ctx)` is a narrower, recommended alternative: it scopes
+the same "allow http" relaxation to `localhost`, `*.localhost`, and loopback
+addresses (`127.0.0.0/8`, `::1`) for that one `DiscoverOAuthRequirements`
+call, while every other blocked hostname (`.local`, `.internal`, cloud
+metadata hosts, etc.) and every other blocked address range (RFC1918,
+link-local, etc.) stays subject to the guard exactly as without the option.
+It answers "is this destination local," not "is the guard on at all," so it
+does not imply `WithSkipSSRFCheck` (or vice versa) — set either, both, or
+neither depending on what the caller needs:
+
+```go
+ctx := oauth.WithAllowLocalHTTP(context.Background())
+discovery, err := oauth.DiscoverOAuthRequirements(ctx, "http://localhost:8080/mcp")
+```
 
 ## Configuring redirect URI validation
 

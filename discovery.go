@@ -274,17 +274,23 @@ func fetchOAuthProtectedResourceMetadata(ctx context.Context, client *http.Clien
 
 // buildRFC8414WellKnownURL constructs the well-known URL per RFC 8414 Section 3.1
 // Inserts /.well-known/oauth-authorization-server between host and path.
-func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
+func buildRFC8414WellKnownURL(ctx context.Context, issuerURL string) (string, error) {
 	parsed, err := url.Parse(issuerURL)
 	if err != nil {
 		return "", fmt.Errorf("invalid issuer URL: %w", err)
 	}
 
 	// RFC 8414 Section 2 requires HTTPS. Local development can explicitly
-	// opt into insecure remote URLs to exercise HTTP-only OAuth providers.
+	// opt into insecure remote URLs (globally) to exercise HTTP-only OAuth
+	// providers, or scope the same relaxation to a single loopback issuer
+	// via WithAllowLocalHTTP.
 	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "https" && (scheme != "http" || !allowInsecureRemoteURLs()) {
-		return "", fmt.Errorf("issuer URL must use https scheme")
+	if scheme != "https" {
+		httpAllowed := scheme == "http" &&
+			(allowInsecureRemoteURLs() || (allowLocalHTTP(ctx) && isLoopbackHost(normalizeHostname(parsed.Hostname()))))
+		if !httpAllowed {
+			return "", fmt.Errorf("issuer URL must use https scheme")
+		}
 	}
 
 	// RFC 8414 Section 2: issuer must not have query
@@ -320,7 +326,7 @@ func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
 // - Validates issuer URL matches authorization server URL (RFC 8414 Section 3.2)
 func fetchAuthorizationServerMetadata(ctx context.Context, client *http.Client, authServerURL string) (*AuthorizationServerMetadata, error) {
 	// RFC 8414 Section 3.1: Construct well-known URL (handles issuer paths correctly)
-	metadataURL, err := buildRFC8414WellKnownURL(authServerURL)
+	metadataURL, err := buildRFC8414WellKnownURL(ctx, authServerURL)
 	if err != nil {
 		return nil, fmt.Errorf("building well-known URL: %w", err)
 	}
