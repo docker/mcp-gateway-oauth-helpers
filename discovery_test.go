@@ -351,6 +351,79 @@ func TestDiscoveryAllowsLocalHTTPAuthorizationServerWithOptIn(t *testing.T) {
 	}
 }
 
+// TestDiscoveryRejectsPlainHTTPLoopbackAuthorizationServerByDefault proves
+// that, without WithAllowLocalHTTP, a plain-http localhost authorization
+// server is still hard-rejected exactly as today: the well-known URL is
+// never even built, let alone fetched.
+func TestDiscoveryRejectsPlainHTTPLoopbackAuthorizationServerByDefault(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+	cleanup := setupInsecureTLSClient(t)
+	defer cleanup()
+
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("authorization server should not be contacted when its scheme is hard-rejected")
+	}))
+	defer authServer.Close()
+	localhostAuthServerURL := strings.Replace(authServer.URL, "127.0.0.1", "localhost", 1)
+
+	mcpServer := newMCPServerPointingTo(localhostAuthServerURL)
+	defer mcpServer.Close()
+
+	_, err := DiscoverOAuthRequirements(context.Background(), mcpServer.URL+"/mcp")
+	if err == nil {
+		t.Fatal("expected discovery to fail for a plain-http localhost authorization server without WithAllowLocalHTTP")
+	}
+	if !strings.Contains(err.Error(), "must use https scheme") {
+		t.Fatalf("expected an https-scheme rejection, got: %v", err)
+	}
+}
+
+// TestDiscoveryAllowsPlainHTTPLoopbackAuthorizationServerWithAllowLocalHTTP
+// proves WithAllowLocalHTTP's core promise: both an http://localhost and an
+// http://127.0.0.1 authorization server become reachable end-to-end through
+// DiscoverOAuthRequirements, with no SSRF warning logged (the destination is
+// classified as fully allowed, not merely warned-and-proceeded).
+func TestDiscoveryAllowsPlainHTTPLoopbackAuthorizationServerWithAllowLocalHTTP(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+	cleanup := setupInsecureTLSClient(t)
+	defer cleanup()
+
+	for _, host := range []string{"localhost", "127.0.0.1"} {
+		t.Run(host, func(t *testing.T) {
+			var authServer *httptest.Server
+			var authServerURL string
+			authServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/.well-known/oauth-authorization-server") {
+					_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
+						Issuer:                authServerURL,
+						AuthorizationEndpoint: authServerURL + "/authorize",
+						TokenEndpoint:         authServerURL + "/token",
+					})
+				}
+			}))
+			defer authServer.Close()
+			authServerURL = strings.Replace(authServer.URL, "127.0.0.1", host, 1)
+
+			mcpServer := newMCPServerPointingTo(authServerURL)
+			defer mcpServer.Close()
+
+			logger := &testLogger{}
+			ctx := WithAllowLocalHTTP(WithLogger(context.Background(), logger))
+
+			discovery, err := DiscoverOAuthRequirements(ctx, mcpServer.URL+"/mcp")
+			if err != nil {
+				t.Fatalf("expected discovery to succeed with WithAllowLocalHTTP for %s, got error: %v", host, err)
+			}
+			if discovery.TokenEndpoint != authServerURL+"/token" {
+				t.Fatalf("expected token endpoint %q, got %q", authServerURL+"/token", discovery.TokenEndpoint)
+			}
+			if len(logger.warns) != 0 {
+				t.Fatalf("expected no SSRF warnings with WithAllowLocalHTTP, got: %v", logger.warns)
+			}
+		})
+	}
+}
+
 type staticResolver map[string][]netip.Addr
 
 func (r staticResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
@@ -399,6 +472,57 @@ func TestAuthorizationServerClientWarnsAndDialsPrivateDNSResult(t *testing.T) {
 	}
 	if !logger.containsWarn("10.0.0.0/8") {
 		t.Fatalf("expected a warning naming the blocked range, got: %v", logger.warns)
+	}
+}
+
+// TestAuthorizationServerClientAllowLocalHTTPDoesNotBypassPrivateAddress
+// proves WithAllowLocalHTTP's carve-out is scoped to loopback only: a
+// non-local private address (10.0.0.5) is not silently allowed through it,
+// it still falls through to the warn-and-proceed default exactly as without
+// the option.
+func TestAuthorizationServerClientAllowLocalHTTPDoesNotBypassPrivateAddress(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("private auth server response"))
+	}))
+	defer authServer.Close()
+
+	var dialedAddress string
+	dialer := &net.Dialer{}
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				dialedAddress = address
+				return dialer.DialContext(ctx, network, authServer.Listener.Addr().String())
+			},
+		},
+	}
+	ctx := WithAllowLocalHTTP(context.Background())
+	client, err := newAuthorizationServerHTTPClientWithResolver(ctx, baseClient, staticResolver{
+		"auth.example.com": {netip.MustParseAddr("10.0.0.5")},
+	})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	logger := &testLogger{}
+	req, err := http.NewRequestWithContext(WithLogger(ctx, logger), http.MethodGet, "https://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expected private DNS result to be dialed anyway, got error: %v", err)
+	}
+	defer resp.Body.Close()
+	if dialedAddress != "10.0.0.5:443" {
+		t.Fatalf("expected the resolved private IP to be dialed, got %q", dialedAddress)
+	}
+	if !logger.containsWarn("10.0.0.0/8") {
+		t.Fatalf("expected WithAllowLocalHTTP to still warn on a non-local private address, got: %v", logger.warns)
 	}
 }
 
@@ -939,7 +1063,7 @@ func TestBuildRFC8414WellKnownURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := buildRFC8414WellKnownURL(tt.issuer)
+			result, err := buildRFC8414WellKnownURL(context.Background(), tt.issuer)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error for issuer %q, got nil", tt.issuer)
@@ -955,5 +1079,58 @@ func TestBuildRFC8414WellKnownURL(t *testing.T) {
 				t.Errorf("buildRFC8414WellKnownURL(%q)\n  got:  %s\n  want: %s", tt.issuer, result, tt.expected)
 			}
 		})
+	}
+}
+
+// TestBuildRFC8414WellKnownURLAllowLocalHTTP proves the http-scheme
+// carve-out is scoped to WithAllowLocalHTTP plus a loopback host: it accepts
+// http for localhost/127.0.0.1 issuers, but still rejects http for a
+// non-local issuer even when the option is set.
+func TestBuildRFC8414WellKnownURLAllowLocalHTTP(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	tests := []struct {
+		name     string
+		issuer   string
+		expected string
+		wantErr  bool
+	}{
+		{
+			name:     "http localhost issuer is accepted",
+			issuer:   "http://localhost:8080",
+			expected: "http://localhost:8080/.well-known/oauth-authorization-server",
+		},
+		{
+			name:     "http loopback IP issuer is accepted",
+			issuer:   "http://127.0.0.1:8080",
+			expected: "http://127.0.0.1:8080/.well-known/oauth-authorization-server",
+		},
+		{
+			name:    "http non-local issuer is still rejected",
+			issuer:  "http://example.com",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := buildRFC8414WellKnownURL(WithAllowLocalHTTP(context.Background()), tt.issuer)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for issuer %q, got nil", tt.issuer)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for issuer %q: %v", tt.issuer, err)
+			}
+			if result != tt.expected {
+				t.Errorf("buildRFC8414WellKnownURL(%q)\n  got:  %s\n  want: %s", tt.issuer, result, tt.expected)
+			}
+		})
+	}
+
+	if _, err := buildRFC8414WellKnownURL(context.Background(), "http://localhost:8080"); err == nil {
+		t.Fatal("expected http localhost issuer to be rejected without WithAllowLocalHTTP")
 	}
 }
