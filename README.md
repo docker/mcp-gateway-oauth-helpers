@@ -14,14 +14,26 @@ This library provides the core OAuth/DCR functions for MCP Gateway:
 
 ## Local development
 
-OAuth discovery allows only public HTTPS authorization servers by default. It
-rejects localhost, private, link-local, and reserved destinations before
-dialing, including redirect targets.
+OAuth discovery's authorization-server SSRF guard is advisory, not blocking:
+by default it flags localhost, private, link-local, and reserved destinations
+(including redirect targets and the DNS-rebinding-safe dial-time address) as
+disallowed, logs a warning naming the rejected address via the `Logger`
+installed with `WithLogger`, and then still makes the request against that
+real address. Discovery only fails when the fetch itself fails for an
+unrelated reason (connection error, TLS failure, timeout, non-200 status,
+unparseable JSON, issuer mismatch).
 
-For local development with an HTTP or private-network OAuth provider, set
-`DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS=1`. This disables the authorization
-server network guard and HTTPS requirement, so it must not be enabled with
-untrusted MCP servers.
+For a single `DiscoverOAuthRequirements` call, `WithSkipSSRFCheck(ctx)` turns
+the guard off entirely for that call: no scheme/hostname/address checks, no
+dial-time pinning, and no warning log. Use it when the caller has already
+made its own trust decision about the target (e.g. an operator explicitly
+opted a request out of the guard).
+
+`DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS=1` is unrelated and unaffected by the
+above: it still exists to relax the RFC 8414 HTTPS scheme requirement for
+local development with an HTTP OAuth provider, and continues to disable the
+authorization server network guard process-wide when set. Prefer
+`WithSkipSSRFCheck` for scoping an opt-out to a single call.
 
 ## Configuring redirect URI validation
 

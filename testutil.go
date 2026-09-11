@@ -32,3 +32,12 @@ func (l *testLogger) containsInfo(substr string) bool {
 	}
 	return false
 }
+
+func (l *testLogger) containsWarn(substr string) bool {
+	for _, msg := range l.warns {
+		if strings.Contains(msg, substr) {
+			return true
+		}
+	}
+	return false
+}
