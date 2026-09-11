@@ -20,10 +20,9 @@ type ipResolver interface {
 var authorizationServerHTTPClientFunc = newAuthorizationServerHTTPClient
 
 // newAuthorizationServerHTTPClient limits attacker-influenced authorization
-// server metadata requests to public HTTP(S) destinations. It resolves and
-// pins the address at dial time so DNS rebinding cannot redirect the
-// connection to a private service. The guarded transport is also used for
-// every redirect.
+// server metadata requests to public HTTPS destinations. It resolves and pins
+// the address at dial time so DNS rebinding cannot redirect the connection to
+// a private service. The guarded transport is also used for every redirect.
 func newAuthorizationServerHTTPClient(client *http.Client) (*http.Client, error) {
 	return newAuthorizationServerHTTPClientWithResolver(client, net.DefaultResolver)
 }
@@ -81,18 +80,18 @@ type publicOnlyRoundTripper struct {
 }
 
 func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := validatePublicAuthServerURL(req.URL); err != nil {
+	if err := validatePublicHTTPSURL(req.URL); err != nil {
 		return nil, err
 	}
 	return t.base.RoundTrip(req)
 }
 
-func validatePublicAuthServerURL(target *url.URL) error {
+func validatePublicHTTPSURL(target *url.URL) error {
 	if target == nil || target.Scheme == "" || target.Host == "" {
 		return fmt.Errorf("authorization server URL must be absolute")
 	}
-	if !strings.EqualFold(target.Scheme, "https") && !strings.EqualFold(target.Scheme, "http") {
-		return fmt.Errorf("authorization server URL must use http or https")
+	if !strings.EqualFold(target.Scheme, "https") {
+		return fmt.Errorf("authorization server URL must use https")
 	}
 	if target.User != nil {
 		return fmt.Errorf("authorization server URL must not include userinfo")
@@ -157,10 +156,11 @@ func normalizeHostname(host string) string {
 func isBlockedHostname(host string) bool {
 	host = normalizeHostname(host)
 	switch host {
-	case "metadata", "metadata.google.internal", "metadata.azure.internal":
+	case "localhost", "metadata", "metadata.google.internal", "metadata.azure.internal":
 		return true
 	}
 	for _, suffix := range []string{
+		".localhost",
 		".local",
 		".localdomain",
 		".internal",
@@ -183,6 +183,7 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("10.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
 	netip.MustParsePrefix("169.254.0.0/16"),
 	netip.MustParsePrefix("172.16.0.0/12"),
 	netip.MustParsePrefix("192.0.0.0/24"),
@@ -195,6 +196,7 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),
 	netip.MustParsePrefix("255.255.255.255/32"),
 	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::1/128"),
 	netip.MustParsePrefix("64:ff9b::/96"),
 	netip.MustParsePrefix("fc00::/7"),
 	netip.MustParsePrefix("fe80::/10"),
@@ -211,9 +213,6 @@ func validatePublicAddr(ip netip.Addr) error {
 	}
 
 	ip = ip.Unmap()
-	if ip.IsLoopback() {
-		return nil
-	}
 	for _, prefix := range blockedPrefixes {
 		if prefix.Contains(ip) {
 			return fmt.Errorf("address is in blocked range %s", prefix)

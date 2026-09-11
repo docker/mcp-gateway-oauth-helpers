@@ -280,12 +280,11 @@ func buildRFC8414WellKnownURL(issuerURL string) (string, error) {
 		return "", fmt.Errorf("invalid issuer URL: %w", err)
 	}
 
-	// RFC 8414 Section 2 requires HTTPS, but the dial-time SSRF guard in
-	// ssrf.go enforces the same public-address restrictions regardless of
-	// scheme, so http and https issuers are both accepted here.
+	// RFC 8414 Section 2 requires HTTPS. Local development can explicitly
+	// opt into insecure remote URLs to exercise HTTP-only OAuth providers.
 	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "https" && scheme != "http" {
-		return "", fmt.Errorf("issuer URL must use http or https scheme")
+	if scheme != "https" && (scheme != "http" || !allowInsecureRemoteURLs()) {
+		return "", fmt.Errorf("issuer URL must use https scheme")
 	}
 
 	// RFC 8414 Section 2: issuer must not have query
