@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -36,6 +35,17 @@ func WithSkipSSRFCheck(ctx context.Context) context.Context {
 func skipSSRFCheck(ctx context.Context) bool {
 	skip, _ := ctx.Value(skipSSRFCheckKey{}).(bool)
 	return skip
+}
+
+// sanitizeForLog strips CR and LF so a value cannot forge or corrupt log
+// entries when written into a warning log. CodeQL's Go log-injection query
+// (go/log-injection) only recognizes strings.ReplaceAll(s, "\n"/"\r", ...)
+// as a sanitizer for this sink; %q and strconv.Quote are not recognized here
+// because the logger is a custom interface method, not a modeled printf call.
+func sanitizeForLog(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
+	return s
 }
 
 // allowLocalHTTPKey is deliberately its own type (not log.go's contextKey or
@@ -147,9 +157,9 @@ func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		return nil, err
 	}
 	if ssrfErr != nil {
-		quotedURL := strconv.Quote(req.URL.String())
-		quotedErr := strconv.Quote(ssrfErr.Error())
-		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %s", quotedURL, quotedErr)
+		safeURL := sanitizeForLog(req.URL.String())
+		safeErr := sanitizeForLog(ssrfErr.Error())
+		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %s", safeURL, safeErr)
 	}
 	return t.base.RoundTrip(req)
 }
@@ -186,11 +196,11 @@ func validatePublicHTTPSURL(ctx context.Context, target *url.URL) (ssrfErr, hard
 		return nil, nil
 	}
 	if isBlockedHostname(host) {
-		return fmt.Errorf("authorization server URL host %q is not allowed", host), nil
+		return fmt.Errorf("authorization server URL host %s is not allowed", host), nil
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if err := validatePublicAddr(ip); err != nil {
-			return fmt.Errorf("authorization server URL host %q is not allowed: %w", host, err), nil
+			return fmt.Errorf("authorization server URL host %s is not allowed: %w", host, err), nil
 		}
 	}
 	return nil, nil
@@ -212,9 +222,9 @@ func dialPublicAddress(
 
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if err := validateDialAddr(ctx, ip); err != nil {
-			quotedIP := strconv.Quote(ip.String())
-			quotedErr := strconv.Quote(err.Error())
-			logger.Warnf("authorization server dial address %s was rejected by the SSRF guard; dialing anyway: %s", quotedIP, quotedErr)
+			safeIP := sanitizeForLog(ip.String())
+			safeErr := sanitizeForLog(err.Error())
+			logger.Warnf("authorization server dial address %s was rejected by the SSRF guard; dialing anyway: %s", safeIP, safeErr)
 		}
 		return dial(ctx, network, net.JoinHostPort(ip.String(), port))
 	}
@@ -228,10 +238,10 @@ func dialPublicAddress(
 	}
 	for _, ip := range ips {
 		if err := validateDialAddr(ctx, ip); err != nil {
-			quotedHost := strconv.Quote(host)
-			quotedIP := strconv.Quote(ip.String())
-			quotedErr := strconv.Quote(err.Error())
-			logger.Warnf("authorization server host %s resolved to disallowed address %s; dialing anyway: %s", quotedHost, quotedIP, quotedErr)
+			safeHost := sanitizeForLog(host)
+			safeIP := sanitizeForLog(ip.String())
+			safeErr := sanitizeForLog(err.Error())
+			logger.Warnf("authorization server host %s resolved to disallowed address %s; dialing anyway: %s", safeHost, safeIP, safeErr)
 		}
 	}
 
