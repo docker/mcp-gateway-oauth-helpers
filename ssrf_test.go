@@ -19,13 +19,14 @@ func (noopBaseRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, fmt.Errorf("noopBaseRoundTripper: no network access in test")
 }
 
-// TestPublicOnlyRoundTripperEscapesControlCharactersInLog guards the fix for
+// TestPublicOnlyRoundTripperStripsControlCharactersInLog guards the fix for
 // the CodeQL "Log entries created from user input" alerts on ssrf.go: a
 // request URL whose host contains control characters (here a raw CRLF) must
 // not be written raw into the SSRF-guard warning log, where it could forge
 // or corrupt log entries. Both interpolated values (the URL and the
-// validation error, which embeds the same host) must come through escaped.
-func TestPublicOnlyRoundTripperEscapesControlCharactersInLog(t *testing.T) {
+// validation error, which embeds the same host) must come through with the
+// control characters stripped.
+func TestPublicOnlyRoundTripperStripsControlCharactersInLog(t *testing.T) {
 	logger := &testLogger{}
 	ctx := WithLogger(context.Background(), logger)
 
@@ -52,9 +53,12 @@ func TestPublicOnlyRoundTripperEscapesControlCharactersInLog(t *testing.T) {
 	warning := logger.warns[0]
 
 	if strings.ContainsAny(warning, "\r\n") {
-		t.Fatalf("expected control characters to be escaped, got raw control characters in warning: %q", warning)
+		t.Fatalf("expected control characters to be stripped, got raw control characters in warning: %q", warning)
 	}
-	if !strings.Contains(warning, `\r`) || !strings.Contains(warning, `\n`) {
-		t.Fatalf("expected the escaped form of the control characters in the warning, got: %q", warning)
+	if strings.Contains(warning, `\r`) || strings.Contains(warning, `\n`) {
+		t.Fatalf("expected control characters to be stripped rather than escaped, got: %q", warning)
+	}
+	if !strings.Contains(warning, "evilinjected: true.internal") {
+		t.Fatalf("expected the non-control text to survive stripping, got: %q", warning)
 	}
 }
