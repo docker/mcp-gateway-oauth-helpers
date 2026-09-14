@@ -39,6 +39,11 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	// Extract logger from context (or use noop if not provided)
 	logger := loggerFromContext(ctx)
 
+	// Collect any authorization-server SSRF guard rejection made while
+	// servicing this call, so it can be stamped onto the returned Discovery
+	// alongside the warning log (see ssrfRecorder).
+	ctx, ssrfRec := contextWithSSRFRecorder(ctx)
+
 	logger.Infof("starting OAuth discovery for server: %s", serverURL)
 
 	// Create HTTP client (can be overridden in tests for TLS support)
@@ -194,6 +199,9 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 		// PKCE support detection (OAuth 2.1 MUST requirement)
 		SupportsPKCE:        slices.Contains(authServerMetadata.CodeChallengeMethodsSupported, "S256"),
 		CodeChallengeMethod: authServerMetadata.CodeChallengeMethodsSupported,
+
+		SSRFCheckFailed: ssrfRec.failed,
+		SSRFCheckReason: ssrfRec.reason,
 	}
 
 	// Override with resource metadata if successfully fetched

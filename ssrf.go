@@ -72,6 +72,39 @@ func allowLocalHTTP(ctx context.Context) bool {
 	return allow
 }
 
+// ssrfRecorder collects the authorization-server SSRF guard's rejections
+// during a single DiscoverOAuthRequirements call, so they can be surfaced on
+// the returned Discovery (SSRFCheckFailed/SSRFCheckReason) in addition to the
+// warning log. Only the first rejection is kept, matching SSRFCheckReason's
+// doc comment; discovery for one call is sequential (the initial request and
+// any redirects it follows run one at a time), so no locking is needed.
+type ssrfRecorder struct {
+	failed bool
+	reason string
+}
+
+type ssrfRecorderKey struct{}
+
+// contextWithSSRFRecorder returns a copy of ctx carrying a fresh ssrfRecorder,
+// along with that same recorder for the caller to read back once discovery
+// completes.
+func contextWithSSRFRecorder(ctx context.Context) (context.Context, *ssrfRecorder) {
+	rec := &ssrfRecorder{}
+	return context.WithValue(ctx, ssrfRecorderKey{}, rec), rec
+}
+
+// recordSSRFRejection notes reason on ctx's ssrfRecorder, if any. Silently a
+// no-op when ctx carries none (e.g. in tests that exercise the guard without
+// going through DiscoverOAuthRequirements).
+func recordSSRFRejection(ctx context.Context, reason string) {
+	rec, ok := ctx.Value(ssrfRecorderKey{}).(*ssrfRecorder)
+	if !ok || rec.failed {
+		return
+	}
+	rec.failed = true
+	rec.reason = reason
+}
+
 // isLoopbackHost reports whether a normalized hostname or textual IP literal
 // refers to localhost or a loopback address. It exists only to scope
 // WithAllowLocalHTTP's carve-out and must not be consulted anywhere the
@@ -160,6 +193,7 @@ func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		safeURL := sanitizeForLog(req.URL.String())
 		safeErr := sanitizeForLog(ssrfErr.Error())
 		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %s", safeURL, safeErr)
+		recordSSRFRejection(req.Context(), fmt.Sprintf("authorization server request to %s was rejected by the SSRF guard: %s", safeURL, safeErr))
 	}
 	return t.base.RoundTrip(req)
 }
@@ -225,6 +259,7 @@ func dialPublicAddress(
 			safeIP := sanitizeForLog(ip.String())
 			safeErr := sanitizeForLog(err.Error())
 			logger.Warnf("authorization server dial address %s was rejected by the SSRF guard; dialing anyway: %s", safeIP, safeErr)
+			recordSSRFRejection(ctx, fmt.Sprintf("authorization server dial address %s was rejected by the SSRF guard: %s", safeIP, safeErr))
 		}
 		return dial(ctx, network, net.JoinHostPort(ip.String(), port))
 	}
@@ -242,6 +277,7 @@ func dialPublicAddress(
 			safeIP := sanitizeForLog(ip.String())
 			safeErr := sanitizeForLog(err.Error())
 			logger.Warnf("authorization server host %s resolved to disallowed address %s; dialing anyway: %s", safeHost, safeIP, safeErr)
+			recordSSRFRejection(ctx, fmt.Sprintf("authorization server host %s resolved to disallowed address %s: %s", safeHost, safeIP, safeErr))
 		}
 	}
 

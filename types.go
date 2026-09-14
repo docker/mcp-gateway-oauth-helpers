@@ -32,6 +32,18 @@ type Discovery struct {
 	ResponseModesSupported            []string // Supported OAuth response modes
 	GrantTypesSupported               []string // Supported OAuth grant types
 	TokenEndpointAuthMethodsSupported []string // Supported client authentication methods
+
+	// SSRFCheckFailed records that the authorization-server SSRF guard (see
+	// ssrf.go) rejected a request or dial made while producing this Discovery
+	// — a disallowed scheme/hostname, or an address the guard blocks. The
+	// guard is warn-and-proceed by default (WithSkipSSRFCheck turns it off
+	// entirely), so discovery still completed; this field lets a caller
+	// surface that after the fact instead of only seeing it in the log.
+	SSRFCheckFailed bool
+	// SSRFCheckReason is the guard's rejection message, present iff
+	// SSRFCheckFailed. When the guard rejects more than one request or dial
+	// during a single discovery, this is the first rejection encountered.
+	SSRFCheckReason string
 }
 
 // ProtectedResourceMetadata represents metadata from /.well-known/oauth-protected-resource
