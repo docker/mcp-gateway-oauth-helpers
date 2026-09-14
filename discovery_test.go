@@ -199,6 +199,9 @@ func TestDiscoveryHappyPath_WithWWWAuthenticate(t *testing.T) {
 	if discovery.ResourceURL != mcpServer.URL+"/mcp" {
 		t.Errorf("Expected ResourceURL=%s, got %s", mcpServer.URL+"/mcp", discovery.ResourceURL)
 	}
+	if discovery.SSRFCheckFailed {
+		t.Errorf("Expected SSRFCheckFailed=false when no request was rejected, got reason: %q", discovery.SSRFCheckReason)
+	}
 }
 
 // TestDiscoveryError_AuthServerFails verifies error handling
@@ -312,6 +315,12 @@ func TestDiscoveryWarnsButProceedsForPrivateAuthorizationServer(t *testing.T) {
 	}
 	if discovery.TokenEndpoint != "https://169.254.169.254/token" {
 		t.Fatalf("expected discovery to complete using the real fetch response, got token endpoint %q", discovery.TokenEndpoint)
+	}
+	if !discovery.SSRFCheckFailed {
+		t.Fatal("expected discovery.SSRFCheckFailed to be true for a rejected private authorization server")
+	}
+	if !strings.Contains(discovery.SSRFCheckReason, "169.254") {
+		t.Fatalf("expected discovery.SSRFCheckReason to name the rejected address, got: %q", discovery.SSRFCheckReason)
 	}
 }
 
@@ -695,6 +704,9 @@ func TestDiscoverySkipSSRFCheckAllowsLoopbackWithoutWarning(t *testing.T) {
 	if len(logger.warns) != 0 {
 		t.Fatalf("expected no warnings with WithSkipSSRFCheck, got: %v", logger.warns)
 	}
+	if discovery.SSRFCheckFailed {
+		t.Fatalf("expected SSRFCheckFailed=false with WithSkipSSRFCheck, got reason: %q", discovery.SSRFCheckReason)
+	}
 }
 
 // TestDiscoveryWarnsAndProceedsForLoopbackAuthorizationServerByDefault proves
@@ -722,6 +734,12 @@ func TestDiscoveryWarnsAndProceedsForLoopbackAuthorizationServerByDefault(t *tes
 	}
 	if !logger.containsWarn("127.0.0.1") {
 		t.Fatalf("expected a warning identifying the rejected loopback address, got: %v", logger.warns)
+	}
+	if !discovery.SSRFCheckFailed {
+		t.Fatal("expected SSRFCheckFailed=true for a rejected loopback authorization server")
+	}
+	if !strings.Contains(discovery.SSRFCheckReason, "127.0.0.1") {
+		t.Fatalf("expected SSRFCheckReason to name the rejected address, got: %q", discovery.SSRFCheckReason)
 	}
 }
 
