@@ -927,6 +927,55 @@ func TestDiscoveryAllowsOriginProtectedResourceForPathBearingEndpoint(t *testing
 	}
 }
 
+// TestDiscoveryAllowsTrailingSlashRootProtectedResource guards a second
+// real-world shape, distinct from the origin-for-path-bearing-endpoint case
+// above: a bare-origin request (no path at all, e.g. "https://mcp.miro.com")
+// whose protected-resource metadata reports its resource WITH an explicit
+// root slash (e.g. "https://mcp.miro.com/"). Per RFC 3986 a URL with no path
+// component and one with path "/" name the same resource, but the two
+// strings differ, and neither the exact-match check nor
+// resourceNamesOrigin (which requires the REQUESTED side to have a path)
+// previously accepted this. Miro's MCP server does exactly this.
+func TestDiscoveryAllowsTrailingSlashRootProtectedResource(t *testing.T) {
+	cleanup := setupTestHTTPClient(t)
+	defer cleanup()
+
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/.well-known/oauth-authorization-server") {
+			baseURL := "https://" + r.Host
+			_ = json.NewEncoder(w).Encode(AuthorizationServerMetadata{
+				Issuer:                baseURL + "/",
+				AuthorizationEndpoint: baseURL + "/authorize",
+				TokenEndpoint:         baseURL + "/token",
+			})
+		}
+	}))
+	defer authServer.Close()
+
+	mcpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseURL := "https://" + r.Host
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/metadata\"", baseURL))
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/metadata":
+			_ = json.NewEncoder(w).Encode(ProtectedResourceMetadata{
+				Resource:            baseURL + "/",
+				AuthorizationServer: authServer.URL + "/",
+			})
+		}
+	}))
+	defer mcpServer.Close()
+
+	discovery, err := DiscoverOAuthRequirements(context.Background(), mcpServer.URL)
+	if err != nil {
+		t.Fatalf("expected trailing-slash root protected resource to be accepted, got error: %v", err)
+	}
+	if !discovery.RequiresOAuth {
+		t.Error("expected RequiresOAuth=true")
+	}
+}
+
 func TestFetchAuthorizationServerMetadataRejectsIssuerMismatch(t *testing.T) {
 	cleanup := setupTestHTTPClient(t)
 	defer cleanup()
@@ -1022,6 +1071,43 @@ func TestValidateSameOrigin(t *testing.T) {
 			}
 			if !tt.wantErr && err != nil {
 				t.Fatalf("unexpected origin error: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateProtectedResource pins the matching matrix across the three
+// checks in validateProtectedResource: exact match, resourceNamesOrigin
+// (bare-origin actual for a path-bearing expected), and resourceNamesSameRoot
+// (both sides resolve to root, e.g. bare origin vs. explicit trailing slash).
+// TestDiscoveryRejectsMismatchedProtectedResource only exercises expected
+// values with a path, so it never drives resourceNamesSameRoot's isRoot(e)
+// branch to false; the cases here fill that gap.
+func TestValidateProtectedResource(t *testing.T) {
+	tests := []struct {
+		expected string
+		actual   string
+		wantOK   bool
+	}{
+		{"https://h", "https://h/", true},
+		{"https://h/", "https://h", true},
+		{"https://h", "https://H/", true},
+		{"https://h", "https://h/other", false},
+		{"https://h", "https://h/?x=1", false},
+		{"https://h", "https://h/#f", false},
+		{"https://h", "http://h/", false},
+		{"https://h/mcp", "https://h", true},
+		{"https://user@h/", "https://h", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s vs %s", tt.expected, tt.actual), func(t *testing.T) {
+			err := validateProtectedResource(tt.expected, tt.actual)
+			if tt.wantOK && err != nil {
+				t.Fatalf("expected %q and actual %q to match, got error: %v", tt.expected, tt.actual, err)
+			}
+			if !tt.wantOK && err == nil {
+				t.Fatalf("expected %q and actual %q to be rejected as mismatched", tt.expected, tt.actual)
 			}
 		})
 	}

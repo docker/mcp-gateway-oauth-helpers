@@ -397,6 +397,9 @@ func validateProtectedResource(expected, actual string) error {
 	if resourceNamesOrigin(actual, expected) {
 		return nil
 	}
+	if resourceNamesSameRoot(actual, expected) {
+		return nil
+	}
 	return fmt.Errorf("protected resource metadata resource %q does not match requested resource %q", actual, expected)
 }
 
@@ -419,6 +422,32 @@ func resourceNamesOrigin(actual, expected string) bool {
 	}
 	return e.Path != "" &&
 		a.Path == "" && a.RawQuery == "" && a.Fragment == "" &&
+		a.User == nil && e.User == nil &&
+		strings.EqualFold(a.Scheme, e.Scheme) && strings.EqualFold(a.Host, e.Host)
+}
+
+// resourceNamesSameRoot reports whether actual and expected name the same
+// origin's root, treating an empty path and a bare "/" as equivalent. Per RFC
+// 3986 the effective path of a URL with no path component is "/", but a
+// request built from a bare origin (e.g. "https://mcp.miro.com") parses with
+// Path == "", while a resource server's own metadata may report its
+// canonical resource with the explicit root slash (e.g.
+// "https://mcp.miro.com/") — same resource, different string. This is
+// narrower than resourceNamesOrigin: both sides must resolve to root, not
+// just one.
+func resourceNamesSameRoot(actual, expected string) bool {
+	a, err := url.Parse(actual)
+	if err != nil {
+		return false
+	}
+	e, err := url.Parse(expected)
+	if err != nil {
+		return false
+	}
+	isRoot := func(u *url.URL) bool {
+		return (u.Path == "" || u.Path == "/") && u.RawQuery == "" && u.Fragment == "" && u.User == nil
+	}
+	return isRoot(a) && isRoot(e) &&
 		strings.EqualFold(a.Scheme, e.Scheme) && strings.EqualFold(a.Host, e.Host)
 }
 
