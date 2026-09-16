@@ -422,6 +422,7 @@ func resourceNamesOrigin(actual, expected string) bool {
 	}
 	return e.Path != "" &&
 		a.Path == "" && a.RawQuery == "" && a.Fragment == "" &&
+		a.User == nil && e.User == nil &&
 		strings.EqualFold(a.Scheme, e.Scheme) && strings.EqualFold(a.Host, e.Host)
 }
 
@@ -444,7 +445,7 @@ func resourceNamesSameRoot(actual, expected string) bool {
 		return false
 	}
 	isRoot := func(u *url.URL) bool {
-		return (u.Path == "" || u.Path == "/") && u.RawQuery == "" && u.Fragment == ""
+		return (u.Path == "" || u.Path == "/") && u.RawQuery == "" && u.Fragment == "" && u.User == nil
 	}
 	return isRoot(a) && isRoot(e) &&
 		strings.EqualFold(a.Scheme, e.Scheme) && strings.EqualFold(a.Host, e.Host)
