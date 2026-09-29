@@ -117,7 +117,32 @@ func PerformDCR(ctx context.Context, discovery *Discovery, serverName string, re
 }
 
 // PerformDCRWithConfig performs Dynamic Client Registration with configurable DCR behavior.
+// It is a thin wrapper over RegisterClient that keeps only the client credentials.
 func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName string, config DCRConfig) (*ClientCredentials, error) {
+	reg, err := RegisterClient(ctx, discovery, serverName, config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create client credentials (public client - no secret)
+	return &ClientCredentials{
+		ClientID:              reg.ClientID,
+		ServerURL:             discovery.ResourceURL,
+		IsPublic:              true,
+		AuthorizationEndpoint: discovery.AuthorizationEndpoint,
+		TokenEndpoint:         discovery.TokenEndpoint,
+		// No ClientSecret for public clients
+	}, nil
+}
+
+// RegisterClient performs Dynamic Client Registration (RFC 7591) and returns the
+// full registration, including the RFC 7592 management credentials
+// (registration_access_token / registration_client_uri) when the server issues
+// them. The result is suitable for persisting and later reuse.
+//
+// Redirect URI handling and the registered client metadata are identical to
+// PerformDCRWithConfig.
+func RegisterClient(ctx context.Context, discovery *Discovery, serverName string, config DCRConfig) (*ClientRegistration, error) {
 	if discovery.RegistrationEndpoint == "" {
 		return nil, fmt.Errorf("no registration endpoint found for %s", serverName)
 	}
@@ -170,8 +195,7 @@ func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName 
 	req.Header.Set("User-Agent", "MCP-Gateway/1.0.0")
 
 	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := dcrHTTPClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send DCR request to %s: %w", discovery.RegistrationEndpoint, err)
 	}
@@ -213,17 +237,50 @@ func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName 
 		return nil, fmt.Errorf("DCR response missing client_id for %s", serverName)
 	}
 
-	// Create client credentials (public client - no secret)
-	creds := &ClientCredentials{
-		ClientID:              dcrResponse.ClientID,
-		ServerURL:             discovery.ResourceURL,
-		IsPublic:              true,
-		AuthorizationEndpoint: discovery.AuthorizationEndpoint,
-		TokenEndpoint:         discovery.TokenEndpoint,
-		// No ClientSecret for public clients
-	}
+	return registrationFromResponse(discovery.Issuer, &dcrResponse, &ClientRegistration{
+		RedirectURIs: registration.RedirectURIs,
+		Scope:        registration.Scope,
+	}), nil
+}
 
-	return creds, nil
+// dcrHTTPClient returns the HTTP client used for registration and RFC 7592
+// client configuration requests.
+func dcrHTTPClient() *http.Client {
+	return &http.Client{}
+}
+
+// registrationFromResponse builds a ClientRegistration from an RFC 7591/7592
+// client information response. Values the server omitted are taken from
+// fallback, which must be non-nil: for a fresh registration it holds what was
+// requested, for GET/PUT it holds the previous registration.
+func registrationFromResponse(issuer string, resp *DCRResponse, fallback *ClientRegistration) *ClientRegistration {
+	reg := *fallback
+	reg.Issuer = issuer
+	if reg.ClientID == "" || resp.ClientID != "" {
+		reg.ClientID = resp.ClientID
+	}
+	// The secret and its expiry describe the same credential, so they are
+	// only replaced together.
+	if resp.ClientSecret != "" || resp.ClientSecretExpiresAt != 0 {
+		reg.ClientSecret = resp.ClientSecret
+		reg.ClientSecretExpiresAt = resp.ClientSecretExpiresAt
+	}
+	if resp.RegistrationAccessToken != "" {
+		reg.RegistrationAccessToken = resp.RegistrationAccessToken
+	}
+	if resp.RegistrationClientURI != "" {
+		reg.RegistrationClientURI = resp.RegistrationClientURI
+	}
+	if len(resp.RedirectURIs) > 0 {
+		reg.RedirectURIs = resp.RedirectURIs
+	}
+	if resp.Scope != "" {
+		reg.Scope = resp.Scope
+	}
+	if resp.TokenEndpointAuthMethod != "" {
+		reg.TokenEndpointAuthMethod = resp.TokenEndpointAuthMethod
+	}
+	return &reg
 }
 
 // joinScopes joins a slice of scopes into a space-separated string

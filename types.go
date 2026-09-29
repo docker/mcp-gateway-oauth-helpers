@@ -151,6 +151,24 @@ type ClientCredentials struct {
 	// No ClientSecret field - public clients don't have secrets
 }
 
+// ClientRegistration is the result of a Dynamic Client Registration (RFC 7591),
+// including the RFC 7592 client configuration credentials. It carries everything
+// needed to reuse a registration later instead of registering again.
+//
+// ClientSecret and RegistrationAccessToken are secrets; callers persisting a
+// registration should keep them out of plain-text blobs.
+type ClientRegistration struct {
+	Issuer                  string   `json:"issuer"`                              // Authorization server issuer that issued this registration
+	ClientID                string   `json:"client_id"`                           // Registered client identifier
+	ClientSecret            string   `json:"client_secret,omitempty"`             // Empty for public clients
+	ClientSecretExpiresAt   int64    `json:"client_secret_expires_at"`            // Unix seconds; 0 = never expires
+	RegistrationAccessToken string   `json:"registration_access_token,omitempty"` // RFC 7592 Bearer token
+	RegistrationClientURI   string   `json:"registration_client_uri,omitempty"`   // RFC 7592 client configuration endpoint
+	RedirectURIs            []string `json:"redirect_uris,omitempty"`
+	Scope                   string   `json:"scope,omitempty"`
+	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty"`
+}
+
 // WWWAuthenticateChallenge represents a parsed WWW-Authenticate challenge
 //
 // RFC 6750 COMPLIANCE - OAuth 2.0 Bearer Token Usage:
