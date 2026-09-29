@@ -13,7 +13,7 @@ import (
 )
 
 func TestRegisterClient_ReturnsFullRegistration(t *testing.T) {
-	regServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	regServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(DCRResponse{
 			ClientID:                "client-1",
@@ -56,7 +56,7 @@ func TestRegisterClient_ReturnsFullRegistration(t *testing.T) {
 }
 
 func TestRegisterClient_FallsBackToRequestedMetadata(t *testing.T) {
-	regServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	regServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "client-1"})
 	}))
 	defer regServer.Close()
@@ -86,7 +86,7 @@ func TestRegisterClient_Errors(t *testing.T) {
 		t.Error("Expected error when registration endpoint missing")
 	}
 
-	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"error":"invalid_redirect_uri"}`))
 	}))
@@ -95,7 +95,7 @@ func TestRegisterClient_Errors(t *testing.T) {
 		t.Error("Expected error on non-2xx registration response")
 	}
 
-	noID := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	noID := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer noID.Close()
@@ -165,7 +165,7 @@ func TestRegistrationRequests_GoneAndErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tt.status)
 			}))
 			defer server.Close()
@@ -203,7 +203,7 @@ func TestRegistrationRequests_NoManagementCredentials(t *testing.T) {
 }
 
 func TestGetRegistration_ClientIDMismatch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "someone-else"})
 	}))
 	defer server.Close()

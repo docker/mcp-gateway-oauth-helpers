@@ -52,6 +52,51 @@ ctx := oauth.WithAllowLocalHTTP(context.Background())
 discovery, err := oauth.DiscoverOAuthRequirements(ctx, "http://localhost:8080/mcp")
 ```
 
+## Reusing a registration (RFC 7592)
+
+`PerformDCRWithConfig` keeps only the client credentials, so a caller cannot
+reuse or manage the registration afterwards. To persist a registration and
+reuse it instead of registering on every authorization, use these helpers:
+
+- `RegisterClient(ctx, discovery, serverName, config)` — same request as
+  `PerformDCRWithConfig`, but returns the full `ClientRegistration`: issuer,
+  `client_id`, `client_secret`, `client_secret_expires_at`,
+  `registration_access_token`, `registration_client_uri`, redirect URIs, scope
+  and token endpoint auth method.
+- `GetRegistration(ctx, reg)` — RFC 7592 GET of `registration_client_uri`.
+  Returns the server's current view of the client.
+- `UpdateRegistration(ctx, reg, req)` — RFC 7592 PUT. `req` is the complete
+  client metadata (the server replaces, it does not merge); use it to renew an
+  expired secret or add a scope or redirect URI.
+- `ErrRegistrationGone` — returned by both when the server answers 401 or 404:
+  the record was dropped, so discard it and register again.
+  `ErrNoRegistrationManagement` — the registration has no
+  `registration_client_uri` / `registration_access_token`, so RFC 7592 is not
+  possible; register again instead.
+- `(*ClientRegistration).SecretExpired(now)` — whether `client_secret_expires_at`
+  has passed (`0` never expires).
+- `IsInvalidClientError(status, body)` / `IsInvalidClientErrorCode(code)` —
+  detect an `invalid_client` (RFC 6749 §5.2) token endpoint response or
+  authorize redirect, meaning the cached registration should be discarded.
+
+```go
+reg, err := oauth.RegisterClient(ctx, discovery, "my-server", cfg)
+// ... persist reg, keeping ClientSecret and RegistrationAccessToken out of
+// plain-text storage ...
+
+got, err := oauth.GetRegistration(ctx, reg)
+switch {
+case errors.Is(err, oauth.ErrRegistrationGone):
+    // the server dropped the client: register again
+case errors.Is(err, oauth.ErrNoRegistrationManagement):
+    // nothing to validate with
+}
+```
+
+`ClientRegistration` marshals `client_secret` and `registration_access_token`
+into JSON, so do not write it to disk as is. mcpruntime keeps those two in a
+separate secret store; see its `docs/dcr-memoization.md`.
+
 ## Configuring redirect URI validation
 
 By default DCR only accepts redirect URI hosts for localhost, `mcp.docker.com`, and `mcp-stage.docker.com`.
