@@ -79,6 +79,13 @@ reuse it instead of registering on every authorization, use these helpers:
   http to loopback hosts, and `WithSkipSSRFCheck` or
   `DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS=1` turn it off. The token is also
   dropped from any redirect that leaves the original origin.
+
+`RegisterClient`, `GetRegistration` and `UpdateRegistration` send their requests
+through the same guarded authorization-server HTTP client as discovery: dial-time
+address pinning and the warn-by-default private-address check (a flagged address
+is logged, not refused), with a 30 second timeout in addition to any context
+deadline. Server-supplied error bodies are truncated to 256 bytes in returned
+errors.
 - `(*ClientRegistration).SecretExpired(now)` — whether `client_secret_expires_at`
   has passed (`0` never expires).
 - `IsInvalidClientError(status, body)` / `IsInvalidClientErrorCode(code)` —

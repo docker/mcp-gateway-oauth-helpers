@@ -16,6 +16,14 @@ import (
 // maxRegistrationResponseBytes bounds how much of an RFC 7592 response is read.
 const maxRegistrationResponseBytes = 1 << 20
 
+// maxErrorBodyBytes bounds how much of a server-supplied response body is
+// echoed into an error message.
+const maxErrorBodyBytes = 256
+
+// registrationRequestTimeout bounds a whole DCR or RFC 7592 request when the
+// HTTP client in use sets no timeout of its own.
+const registrationRequestTimeout = 30 * time.Second
+
 var (
 	// ErrRegistrationGone is returned by GetRegistration and UpdateRegistration
 	// when the authorization server answers 401 or 404 for the registration:
@@ -121,7 +129,7 @@ func doRegistrationRequest(ctx context.Context, method string, reg *ClientRegist
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound:
 		return nil, fmt.Errorf("%s %s returned status %d: %w", method, reg.RegistrationClientURI, resp.StatusCode, ErrRegistrationGone)
 	case resp.StatusCode != http.StatusOK:
-		return nil, fmt.Errorf("client configuration %s failed with status %d: %s", method, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return nil, fmt.Errorf("client configuration %s failed with status %d: %s", method, resp.StatusCode, truncateForError(string(respBody)))
 	}
 
 	var dcrResponse DCRResponse
@@ -175,7 +183,7 @@ func requireSecureRegistrationURL(ctx context.Context, rawURL string) error {
 // registration access token is dropped from any redirect that leaves the
 // original scheme, host, and port.
 func registrationHTTPClient(ctx context.Context) (*http.Client, error) {
-	client, err := authorizationServerHTTPClientFunc(ctx, httpClientFunc())
+	client, err := dcrHTTPClient(ctx)
 	if err != nil {
 		return nil, err
 	}

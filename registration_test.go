@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func TestRegisterClient_ReturnsFullRegistration(t *testing.T) {
 		Scopes:               []string{"mcp:read"},
 	}
 
-	reg, err := RegisterClient(context.Background(), discovery, "test-server", DCRConfig{})
+	reg, err := RegisterClient(localHTTPContext(), discovery, "test-server", DCRConfig{})
 	if err != nil {
 		t.Fatalf("RegisterClient failed: %v", err)
 	}
@@ -67,7 +68,7 @@ func TestRegisterClient_FallsBackToRequestedMetadata(t *testing.T) {
 		RegistrationEndpoint: regServer.URL,
 		Scopes:               []string{"read", "write"},
 	}
-	reg, err := RegisterClient(context.Background(), discovery, "test-server", DCRConfig{RedirectURI: "http://localhost:5000/callback"})
+	reg, err := RegisterClient(localHTTPContext(), discovery, "test-server", DCRConfig{RedirectURI: "http://localhost:5000/callback"})
 	if err != nil {
 		t.Fatalf("RegisterClient failed: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestRegisterClient_Errors(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"invalid_redirect_uri"}`))
 	}))
 	defer failing.Close()
-	if _, err := RegisterClient(context.Background(), &Discovery{RegistrationEndpoint: failing.URL}, "test-server", DCRConfig{}); err == nil {
+	if _, err := RegisterClient(localHTTPContext(), &Discovery{RegistrationEndpoint: failing.URL}, "test-server", DCRConfig{}); err == nil {
 		t.Error("Expected error on non-2xx registration response")
 	}
 
@@ -100,7 +101,7 @@ func TestRegisterClient_Errors(t *testing.T) {
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer noID.Close()
-	if _, err := RegisterClient(context.Background(), &Discovery{RegistrationEndpoint: noID.URL}, "test-server", DCRConfig{}); err == nil {
+	if _, err := RegisterClient(localHTTPContext(), &Discovery{RegistrationEndpoint: noID.URL}, "test-server", DCRConfig{}); err == nil {
 		t.Error("Expected error when response has no client_id")
 	}
 }
@@ -492,7 +493,7 @@ func TestRegisterClient_EmptyResponseFieldsFallBackToRequest(t *testing.T) {
 	}))
 	defer regServer.Close()
 
-	reg, err := RegisterClient(context.Background(), &Discovery{
+	reg, err := RegisterClient(localHTTPContext(), &Discovery{
 		Issuer:               "https://auth.example.com",
 		RegistrationEndpoint: regServer.URL,
 		Scopes:               []string{"read"},
@@ -654,4 +655,186 @@ func TestRegistrationRequests_InsecureOptOuts(t *testing.T) {
 			t.Fatalf("expected ErrInsecureRegistrationURI, got %v", err)
 		}
 	})
+}
+
+// A private-range registration_client_uri is not a hard failure (the guard is
+// advisory by default, see AGENTS.md), but it must be flagged through the
+// guard's warning rather than dialed silently.
+func TestRegistrationRequests_PrivateAddressIsFlagged(t *testing.T) {
+	defer setupInsecureTLSClient(t)()
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "client-1"})
+	}))
+	defer server.Close() // 127.0.0.1: a blocked address
+
+	logger := &testLogger{}
+	ctx := WithLogger(context.Background(), logger)
+	ctx, rec := contextWithSSRFRecorder(ctx)
+	reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL}
+	if _, err := GetRegistration(ctx, reg); err != nil {
+		t.Fatalf("advisory guard must not block the request: %v", err)
+	}
+	if !rec.failed {
+		t.Fatal("expected the SSRF guard to flag the loopback registration_client_uri")
+	}
+	if len(logger.warns) == 0 {
+		t.Error("expected an SSRF guard warning to be logged")
+	}
+
+	// The opt-out silences the guard entirely.
+	logger = &testLogger{}
+	ctx, rec = contextWithSSRFRecorder(WithSkipSSRFCheck(WithLogger(context.Background(), logger)))
+	if _, err := GetRegistration(ctx, reg); err != nil {
+		t.Fatalf("GetRegistration with WithSkipSSRFCheck failed: %v", err)
+	}
+	if rec.failed || len(logger.warns) != 0 {
+		t.Errorf("WithSkipSSRFCheck should skip the guard: failed=%v warnings=%v", rec.failed, logger.warns)
+	}
+}
+
+// The registration requests go through the guarded client: it pins dialing,
+// ignores proxies, and carries a bounded timeout.
+func TestDCRHTTPClient_GuardedAndBounded(t *testing.T) {
+	defer setupInsecureTLSClient(t)()
+
+	client, err := dcrHTTPClient(context.Background())
+	if err != nil {
+		t.Fatalf("dcrHTTPClient failed: %v", err)
+	}
+	if _, ok := client.Transport.(*publicOnlyRoundTripper); !ok {
+		t.Errorf("expected guarded transport, got %T", client.Transport)
+	}
+	if client.Timeout != registrationRequestTimeout {
+		t.Errorf("expected timeout %v, got %v", registrationRequestTimeout, client.Timeout)
+	}
+
+	unguarded, err := dcrHTTPClient(WithSkipSSRFCheck(context.Background()))
+	if err != nil {
+		t.Fatalf("dcrHTTPClient failed: %v", err)
+	}
+	if _, ok := unguarded.Transport.(*publicOnlyRoundTripper); ok {
+		t.Error("WithSkipSSRFCheck should leave the transport unguarded")
+	}
+	if unguarded.Timeout != registrationRequestTimeout {
+		t.Errorf("timeout must apply with the guard opted out too, got %v", unguarded.Timeout)
+	}
+}
+
+func TestRegistrationRequests_HonorContextDeadline(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithTimeout(localHTTPContext(), 50*time.Millisecond)
+	defer cancel()
+	reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL}
+	start := time.Now()
+	if _, err := GetRegistration(ctx, reg); err == nil {
+		t.Fatal("expected a deadline error")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("request ignored the context deadline (took %v)", elapsed)
+	}
+}
+
+func TestRegistrationRequests_ErrorBodyTruncated(t *testing.T) {
+	huge := strings.Repeat("secret-internal-data ", 50000) // ~1 MB
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(huge))
+	}))
+	defer server.Close()
+
+	reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL}
+	_, getErr := GetRegistration(localHTTPContext(), reg)
+	_, putErr := UpdateRegistration(localHTTPContext(), reg, DCRRequest{})
+	for op, err := range map[string]error{"GET": getErr, "PUT": putErr} {
+		if err == nil {
+			t.Fatalf("%s: expected error", op)
+		}
+		if len(err.Error()) > maxErrorBodyBytes+200 {
+			t.Errorf("%s: error is %d bytes; response body was not truncated", op, len(err.Error()))
+		}
+		if !strings.Contains(err.Error(), "secret-internal-data") || !strings.Contains(err.Error(), "truncated") {
+			t.Errorf("%s: expected a truncated body excerpt, got %q", op, err.Error())
+		}
+	}
+}
+
+func TestRegisterClient_ErrorBodyTruncatedAndBounded(t *testing.T) {
+	t.Run("plain body", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(strings.Repeat("x", 4<<20)))
+		}))
+		defer server.Close()
+
+		_, err := RegisterClient(localHTTPContext(), &Discovery{RegistrationEndpoint: server.URL}, "test-server", DCRConfig{})
+		if err == nil || len(err.Error()) > maxErrorBodyBytes+200 {
+			t.Fatalf("expected a bounded error, got %v", err)
+		}
+	})
+	t.Run("json error_description", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error_description": strings.Repeat("y", 100000)})
+		}))
+		defer server.Close()
+
+		_, err := RegisterClient(localHTTPContext(), &Discovery{RegistrationEndpoint: server.URL}, "test-server", DCRConfig{})
+		if err == nil || len(err.Error()) > maxErrorBodyBytes+200 {
+			t.Fatalf("expected a bounded error, got %v", err)
+		}
+	})
+	t.Run("short body kept", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_redirect_uri"}`))
+		}))
+		defer server.Close()
+
+		_, err := RegisterClient(localHTTPContext(), &Discovery{RegistrationEndpoint: server.URL}, "test-server", DCRConfig{})
+		if err == nil || !strings.Contains(err.Error(), "invalid_redirect_uri") || strings.Contains(err.Error(), "truncated") {
+			t.Fatalf("expected the short error intact, got %v", err)
+		}
+	})
+}
+
+func TestRegisterClient_RequiresHTTPSRegistrationEndpoint(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "client-1"})
+	}))
+	defer server.Close()
+
+	_, err := RegisterClient(context.Background(), &Discovery{RegistrationEndpoint: server.URL}, "test-server", DCRConfig{})
+	if err == nil {
+		t.Fatal("expected plain-http registration endpoint to be refused")
+	}
+	if requests.Load() != 0 {
+		t.Errorf("server received %d requests", requests.Load())
+	}
+}
+
+func TestRegisterClient_HTTPSPath(t *testing.T) {
+	defer setupInsecureTLSClient(t)()
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "client-1"})
+	}))
+	defer server.Close()
+
+	reg, err := RegisterClient(context.Background(), &Discovery{RegistrationEndpoint: server.URL}, "test-server", DCRConfig{})
+	if err != nil {
+		t.Fatalf("RegisterClient over https failed: %v", err)
+	}
+	if reg.ClientID != "client-1" {
+		t.Errorf("unexpected registration: %#v", reg)
+	}
 }

@@ -40,7 +40,7 @@ func TestPerformDCR_PublicClient(t *testing.T) {
 	}
 
 	// Perform DCR (empty redirectURI uses default)
-	creds, err := PerformDCR(context.Background(), discovery, "test-server", "")
+	creds, err := PerformDCR(localHTTPContext(), discovery, "test-server", "")
 	// Verify no error
 	if err != nil {
 		t.Fatalf("DCR failed: %v", err)
@@ -221,7 +221,7 @@ func TestPerformDCRWithConfig_CustomAllowedRedirectURIHost(t *testing.T) {
 		ResourceURL:           "https://api.example.com",
 	}
 
-	creds, err := PerformDCRWithConfig(context.Background(), discovery, "test-server", DCRConfig{
+	creds, err := PerformDCRWithConfig(localHTTPContext(), discovery, "test-server", DCRConfig{
 		RedirectURI:             redirectURI,
 		AllowedRedirectURIHosts: []string{"oauth.example.com"},
 	})

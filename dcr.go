@@ -195,7 +195,11 @@ func RegisterClient(ctx context.Context, discovery *Discovery, serverName string
 	req.Header.Set("User-Agent", "MCP-Gateway/1.0.0")
 
 	// Send the request
-	resp, err := dcrHTTPClient().Do(req)
+	client, err := dcrHTTPClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DCR HTTP client: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send DCR request to %s: %w", discovery.RegistrationEndpoint, err)
 	}
@@ -204,7 +208,7 @@ func RegisterClient(ctx context.Context, discovery *Discovery, serverName string
 	// Check response status (201 Created or 200 OK are acceptable)
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		// Read error response body to understand why DCR failed
-		errorBody, err := io.ReadAll(resp.Body)
+		errorBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRegistrationResponseBytes))
 		if err != nil {
 			return nil, fmt.Errorf("DCR failed with status %d for %s", resp.StatusCode, serverName)
 		}
@@ -224,12 +228,12 @@ func RegisterClient(ctx context.Context, discovery *Discovery, serverName string
 			}
 		}
 
-		return nil, fmt.Errorf("DCR failed with status %d for %s: %s", resp.StatusCode, serverName, errorMsg)
+		return nil, fmt.Errorf("DCR failed with status %d for %s: %s", resp.StatusCode, serverName, truncateForError(errorMsg))
 	}
 
 	// Parse the response
 	var dcrResponse DCRResponse
-	if err := json.NewDecoder(resp.Body).Decode(&dcrResponse); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRegistrationResponseBytes)).Decode(&dcrResponse); err != nil {
 		return nil, fmt.Errorf("failed to decode DCR response: %w", err)
 	}
 
@@ -244,9 +248,33 @@ func RegisterClient(ctx context.Context, discovery *Discovery, serverName string
 }
 
 // dcrHTTPClient returns the HTTP client used for registration and RFC 7592
-// client configuration requests.
-func dcrHTTPClient() *http.Client {
-	return &http.Client{}
+// client configuration requests. It is the authorization-server guarded client
+// (https requirement, dial-time address pinning, advisory SSRF warnings, and
+// the WithSkipSSRFCheck / WithAllowLocalHTTP / environment opt-outs), bounded
+// by registrationRequestTimeout. The caller's context deadline still applies.
+func dcrHTTPClient(ctx context.Context) (*http.Client, error) {
+	base := httpClientFunc()
+	if base == nil {
+		return nil, fmt.Errorf("HTTP client is nil")
+	}
+	if base.Timeout == 0 {
+		// Copy before modifying: the func may hand out a shared client.
+		withTimeout := *base
+		withTimeout.Timeout = registrationRequestTimeout
+		base = &withTimeout
+	}
+	return authorizationServerHTTPClientFunc(ctx, base)
+}
+
+// truncateForError bounds text that originates from a remote server before it
+// is placed in an error, so a hostile server cannot use error messages to
+// carry a large response back to the caller.
+func truncateForError(text string) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= maxErrorBodyBytes {
+		return text
+	}
+	return strings.ToValidUTF8(text[:maxErrorBodyBytes], "") + "... (truncated)"
 }
 
 // responseFields records which members were present (and not null) in the
