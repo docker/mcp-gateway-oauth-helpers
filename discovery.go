@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,14 @@ import (
 // httpClientFunc allows tests to inject a custom HTTP client (e.g., for TLS test servers)
 var httpClientFunc = func() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second}
+}
+
+type clientNameKey struct{}
+
+// WithClientName sets clientInfo.name on the MCP initialize probe used by
+// DiscoverOAuthRequirements. An empty name uses the default "mcp-gateway".
+func WithClientName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, clientNameKey{}, name)
 }
 
 // DiscoverOAuthRequirements probes an MCP server to discover OAuth requirements
@@ -58,8 +67,24 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	// STEP 1: Make initial MCP request to trigger 401 Unauthorized
 	// MCP Spec Section 4.1: "MCP request without token" should trigger 401
 	// Use POST with initialize request as per spec diagrams
-	mcpPayload := `{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-gateway","version":"1.0.0"}},"id":1}`
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL, strings.NewReader(mcpPayload))
+	clientName, _ := ctx.Value(clientNameKey{}).(string)
+	if clientName == "" {
+		clientName = "mcp-gateway"
+	}
+	mcpPayload, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "initialize",
+		"id":      1,
+		"params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{},
+			"clientInfo": map[string]string{
+				"name":    clientName,
+				"version": "1.0.0",
+			},
+		},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL, bytes.NewReader(mcpPayload))
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
