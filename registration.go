@@ -28,7 +28,16 @@ var (
 	// registration_client_uri or registration_access_token, so RFC 7592
 	// operations are not possible. Callers should re-register instead.
 	ErrNoRegistrationManagement = errors.New("client registration has no RFC 7592 management credentials")
+
+	// ErrInsecureRegistrationURI is returned by GetRegistration and
+	// UpdateRegistration when registration_client_uri, or a redirect from it,
+	// is not an acceptable https URL. The registration access token is never
+	// sent to such a URL. Test with errors.Is.
+	ErrInsecureRegistrationURI = errors.New("registration_client_uri must use https")
 )
+
+// maxRegistrationRedirects matches net/http's default redirect limit.
+const maxRegistrationRedirects = 10
 
 // SecretExpired reports whether the registration's client secret has expired
 // at now (client_secret_expires_at is non-zero and now has reached it).
@@ -72,6 +81,12 @@ func doRegistrationRequest(ctx context.Context, method string, reg *ClientRegist
 		return nil, ErrNoRegistrationManagement
 	}
 
+	// Refuse a non-https URI before anything, the bearer token included, is
+	// built or sent.
+	if err := requireSecureRegistrationURL(ctx, reg.RegistrationClientURI); err != nil {
+		return nil, err
+	}
+
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -87,7 +102,11 @@ func doRegistrationRequest(ctx context.Context, method string, reg *ClientRegist
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := dcrHTTPClient().Do(req)
+	client, err := registrationHTTPClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client configuration HTTP client: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send client configuration request to %s: %w", reg.RegistrationClientURI, err)
 	}
@@ -120,6 +139,59 @@ func doRegistrationRequest(ctx context.Context, method string, reg *ClientRegist
 	}
 
 	return registrationFromResponse(reg.Issuer, &dcrResponse, reg, present), nil
+}
+
+// insecureRegistrationAllowed reports whether the caller explicitly opted out
+// of the authorization-server transport's https requirement, through the
+// process-wide DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS or a per-call
+// WithSkipSSRFCheck. WithAllowLocalHTTP is narrower and is handled by
+// validatePublicHTTPSURL itself.
+func insecureRegistrationAllowed(ctx context.Context) bool {
+	return allowInsecureRemoteURLs() || skipSSRFCheck(ctx)
+}
+
+// requireSecureRegistrationURL applies the authorization-server transport's
+// hard URL requirements (absolute, https unless a development opt-out
+// applies, no userinfo) to a registration management URL. SSRF-guard
+// findings stay advisory and are left to the transport.
+func requireSecureRegistrationURL(ctx context.Context, rawURL string) error {
+	if insecureRegistrationAllowed(ctx) {
+		return nil
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("%w: invalid URL", ErrInsecureRegistrationURI)
+	}
+	if _, hardErr := validatePublicHTTPSURL(ctx, parsed); hardErr != nil {
+		return fmt.Errorf("%w: %v", ErrInsecureRegistrationURI, hardErr)
+	}
+	return nil
+}
+
+// registrationHTTPClient returns the client for RFC 7592 requests: the
+// authorization-server guarded client, which enforces the https requirement
+// on every request it makes (redirects included), with a redirect policy that
+// also holds when a development opt-out disables that transport check. The
+// registration access token is dropped from any redirect that leaves the
+// original scheme, host, and port.
+func registrationHTTPClient(ctx context.Context) (*http.Client, error) {
+	client, err := authorizationServerHTTPClientFunc(ctx, httpClientFunc())
+	if err != nil {
+		return nil, err
+	}
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxRegistrationRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxRegistrationRedirects)
+		}
+		if err := requireSecureRegistrationURL(req.Context(), req.URL.String()); err != nil {
+			return fmt.Errorf("refusing registration redirect: %w", err)
+		}
+		if first := via[0].URL; !strings.EqualFold(req.URL.Scheme, first.Scheme) || !strings.EqualFold(req.URL.Host, first.Host) {
+			req.Header.Del("Authorization")
+		}
+		return nil
+	}
+	return client, nil
 }
 
 // IsInvalidClientError reports whether an OAuth token endpoint response body

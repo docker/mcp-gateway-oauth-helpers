@@ -73,6 +73,12 @@ reuse it instead of registering on every authorization, use these helpers:
   `ErrNoRegistrationManagement` — the registration has no
   `registration_client_uri` / `registration_access_token`, so RFC 7592 is not
   possible; register again instead.
+  `ErrInsecureRegistrationURI` — `registration_client_uri`, or a redirect from
+  it, is not https; the registration access token is never sent. The check
+  follows the authorization-server transport: `WithAllowLocalHTTP` permits
+  http to loopback hosts, and `WithSkipSSRFCheck` or
+  `DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS=1` turn it off. The token is also
+  dropped from any redirect that leaves the original origin.
 - `(*ClientRegistration).SecretExpired(now)` — whether `client_secret_expires_at`
   has passed (`0` never expires).
 - `IsInvalidClientError(status, body)` / `IsInvalidClientErrorCode(code)` —

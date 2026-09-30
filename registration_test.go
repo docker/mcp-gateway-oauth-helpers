@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -127,7 +128,7 @@ func TestGetRegistration(t *testing.T) {
 		RegistrationClientURI:   server.URL + "/register/client-1",
 		Scope:                   "old",
 	}
-	got, err := GetRegistration(context.Background(), reg)
+	got, err := GetRegistration(localHTTPContext(), reg)
 	if err != nil {
 		t.Fatalf("GetRegistration failed: %v", err)
 	}
@@ -172,8 +173,8 @@ func TestRegistrationRequests_GoneAndErrors(t *testing.T) {
 
 			reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL}
 
-			_, getErr := GetRegistration(context.Background(), reg)
-			_, putErr := UpdateRegistration(context.Background(), reg, DCRRequest{})
+			_, getErr := GetRegistration(localHTTPContext(), reg)
+			_, putErr := UpdateRegistration(localHTTPContext(), reg, DCRRequest{})
 			for op, err := range map[string]error{"GET": getErr, "PUT": putErr} {
 				if err == nil {
 					t.Fatalf("%s: expected error for status %d", op, tt.status)
@@ -208,7 +209,7 @@ func TestGetRegistration_ClientIDMismatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := GetRegistration(context.Background(), &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL})
+	_, err := GetRegistration(localHTTPContext(), &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL})
 	if err == nil {
 		t.Fatal("Expected error when response client_id differs")
 	}
@@ -243,7 +244,7 @@ func TestUpdateRegistration(t *testing.T) {
 		RegistrationAccessToken: "rat-1",
 		RegistrationClientURI:   server.URL,
 	}
-	got, err := UpdateRegistration(context.Background(), reg, DCRRequest{
+	got, err := UpdateRegistration(localHTTPContext(), reg, DCRRequest{
 		ClientName:              "MCP Gateway - test",
 		RedirectURIs:            []string{"http://localhost:6000/callback"},
 		TokenEndpointAuthMethod: "none",
@@ -455,9 +456,9 @@ func TestManagementResponse_FieldPresence(t *testing.T) {
 				var got *ClientRegistration
 				var err error
 				if method == http.MethodGet {
-					got, err = GetRegistration(context.Background(), reg)
+					got, err = GetRegistration(localHTTPContext(), reg)
 				} else {
-					got, err = UpdateRegistration(context.Background(), reg, DCRRequest{})
+					got, err = UpdateRegistration(localHTTPContext(), reg, DCRRequest{})
 				}
 				if err != nil {
 					t.Fatalf("%s failed: %v", method, err)
@@ -479,7 +480,7 @@ func TestManagementResponse_InvalidJSONObject(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := GetRegistration(context.Background(), &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL})
+	_, err := GetRegistration(localHTTPContext(), &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL})
 	if err == nil {
 		t.Fatal("Expected error when response is not a JSON object")
 	}
@@ -502,4 +503,155 @@ func TestRegisterClient_EmptyResponseFieldsFallBackToRequest(t *testing.T) {
 	if reg.Scope != "read" || !reflect.DeepEqual(reg.RedirectURIs, []string{"http://localhost:5000/callback"}) {
 		t.Errorf("Expected initial registration to keep requested metadata, got %#v", reg)
 	}
+}
+
+// localHTTPContext opts a test into the http + loopback carve-out so the
+// plain-http httptest servers used below are accepted. Tests of the https
+// requirement itself use context.Background().
+func localHTTPContext() context.Context {
+	return WithAllowLocalHTTP(context.Background())
+}
+
+func TestRegistrationRequests_RejectNonHTTPSURI(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "client-1"})
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name string
+		uri  string
+	}{
+		{"http", server.URL + "/register/client-1"},
+		{"remote http", "http://auth.example.com/register/client-1"},
+		{"no scheme", "auth.example.com/register/client-1"},
+		{"userinfo", "https://user:pw@auth.example.com/register/client-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat-secret", RegistrationClientURI: tt.uri}
+
+			_, getErr := GetRegistration(context.Background(), reg)
+			_, putErr := UpdateRegistration(context.Background(), reg, DCRRequest{})
+			for op, err := range map[string]error{"GET": getErr, "PUT": putErr} {
+				if !errors.Is(err, ErrInsecureRegistrationURI) {
+					t.Errorf("%s: expected ErrInsecureRegistrationURI, got %v", op, err)
+				}
+			}
+		})
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("server received %d requests; the registration token must not be sent to a non-https URI", n)
+	}
+}
+
+func TestRegistrationRequests_HTTPSAllowed(t *testing.T) {
+	defer setupInsecureTLSClient(t)()
+
+	var gotAuth string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "client-1", Scope: "mcp:read"})
+	}))
+	defer server.Close()
+
+	reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat-1", RegistrationClientURI: server.URL}
+	got, err := GetRegistration(context.Background(), reg)
+	if err != nil {
+		t.Fatalf("GetRegistration over https failed: %v", err)
+	}
+	if gotAuth != "Bearer rat-1" || got.Scope != "mcp:read" {
+		t.Errorf("unexpected https result: auth=%q registration=%#v", gotAuth, got)
+	}
+	if _, err := UpdateRegistration(context.Background(), reg, DCRRequest{}); err != nil {
+		t.Fatalf("UpdateRegistration over https failed: %v", err)
+	}
+}
+
+func TestRegistrationRequests_RejectHTTPRedirect(t *testing.T) {
+	defer setupInsecureTLSClient(t)()
+
+	var plainRequests atomic.Int32
+	var plainAuth atomic.Value
+	plain := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		plainRequests.Add(1)
+		plainAuth.Store(r.Header.Get("Authorization"))
+	}))
+	defer plain.Close()
+
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/register/client-1", http.StatusTemporaryRedirect)
+	}))
+	defer secure.Close()
+
+	reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat-secret", RegistrationClientURI: secure.URL}
+	_, getErr := GetRegistration(context.Background(), reg)
+	_, putErr := UpdateRegistration(context.Background(), reg, DCRRequest{})
+	for op, err := range map[string]error{"GET": getErr, "PUT": putErr} {
+		if !errors.Is(err, ErrInsecureRegistrationURI) {
+			t.Errorf("%s: expected ErrInsecureRegistrationURI for https->http redirect, got %v", op, err)
+		}
+	}
+	if n := plainRequests.Load(); n != 0 {
+		t.Fatalf("http redirect target received %d requests (Authorization %v)", n, plainAuth.Load())
+	}
+}
+
+// With the guard opted out the initial scheme check is off, but the token
+// must still not follow a redirect to a different origin.
+func TestRegistrationRequests_RedirectDropsAuthorizationAcrossOrigins(t *testing.T) {
+	defer setupInsecureTLSClient(t)()
+
+	var otherAuth atomic.Value
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherAuth.Store(r.Header.Get("Authorization"))
+		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "client-1"})
+	}))
+	defer other.Close()
+
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL, http.StatusTemporaryRedirect)
+	}))
+	defer secure.Close()
+
+	reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat-secret", RegistrationClientURI: secure.URL}
+	if _, err := GetRegistration(context.Background(), reg); err != nil {
+		t.Fatalf("GetRegistration failed: %v", err)
+	}
+	if got, _ := otherAuth.Load().(string); got != "" {
+		t.Errorf("Authorization leaked to a different origin: %q", got)
+	}
+}
+
+func TestRegistrationRequests_InsecureOptOuts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(DCRResponse{ClientID: "client-1"})
+	}))
+	defer server.Close()
+	reg := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL}
+
+	t.Run("WithAllowLocalHTTP", func(t *testing.T) {
+		if _, err := GetRegistration(WithAllowLocalHTTP(context.Background()), reg); err != nil {
+			t.Fatalf("expected loopback http to be allowed: %v", err)
+		}
+	})
+	t.Run("WithSkipSSRFCheck", func(t *testing.T) {
+		if _, err := GetRegistration(WithSkipSSRFCheck(context.Background()), reg); err != nil {
+			t.Fatalf("expected http to be allowed: %v", err)
+		}
+	})
+	t.Run("environment override", func(t *testing.T) {
+		t.Setenv(allowInsecureRemoteURLEnv, "1")
+		if _, err := GetRegistration(context.Background(), reg); err != nil {
+			t.Fatalf("expected http to be allowed: %v", err)
+		}
+	})
+	t.Run("WithAllowLocalHTTP does not cover remote hosts", func(t *testing.T) {
+		remote := &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: "http://auth.example.com/register"}
+		if _, err := GetRegistration(WithAllowLocalHTTP(context.Background()), remote); !errors.Is(err, ErrInsecureRegistrationURI) {
+			t.Fatalf("expected ErrInsecureRegistrationURI, got %v", err)
+		}
+	})
 }
