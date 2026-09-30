@@ -343,3 +343,163 @@ func TestIsInvalidClientErrorCode(t *testing.T) {
 		}
 	}
 }
+
+func TestManagementResponse_FieldPresence(t *testing.T) {
+	previous := func(uri string) *ClientRegistration {
+		return &ClientRegistration{
+			Issuer:                  "https://auth.example.com",
+			ClientID:                "client-1",
+			ClientSecret:            "secret-1",
+			ClientSecretExpiresAt:   1900000000,
+			RegistrationAccessToken: "rat-1",
+			RegistrationClientURI:   uri,
+			RedirectURIs:            []string{"http://localhost:5000/callback"},
+			Scope:                   "mcp:read mcp:write",
+			TokenEndpointAuthMethod: "client_secret_basic",
+		}
+	}
+
+	tests := []struct {
+		name string
+		body string
+		// mutate turns the previous registration into the expected result.
+		mutate func(*ClientRegistration)
+	}{
+		{
+			name:   "absent fields are preserved",
+			body:   `{"client_id":"client-1"}`,
+			mutate: func(*ClientRegistration) {},
+		},
+		{
+			name:   "null fields are treated as absent",
+			body:   `{"client_id":"client-1","scope":null,"redirect_uris":null}`,
+			mutate: func(*ClientRegistration) {},
+		},
+		{
+			name: "explicit empty scope and redirect_uris are cleared",
+			body: `{"client_id":"client-1","scope":"","redirect_uris":[]}`,
+			mutate: func(r *ClientRegistration) {
+				r.Scope = ""
+				r.RedirectURIs = []string{}
+			},
+		},
+		{
+			name: "explicit empty token_endpoint_auth_method is cleared",
+			body: `{"client_id":"client-1","token_endpoint_auth_method":""}`,
+			mutate: func(r *ClientRegistration) {
+				r.TokenEndpointAuthMethod = ""
+			},
+		},
+		{
+			name: "non-empty values replace previous ones",
+			body: `{"client_id":"client-1","scope":"mcp:read","redirect_uris":["http://localhost:6000/callback"],"token_endpoint_auth_method":"none"}`,
+			mutate: func(r *ClientRegistration) {
+				r.Scope = "mcp:read"
+				r.RedirectURIs = []string{"http://localhost:6000/callback"}
+				r.TokenEndpointAuthMethod = "none"
+			},
+		},
+		{
+			name: "only the fields present are changed",
+			body: `{"client_id":"client-1","scope":""}`,
+			mutate: func(r *ClientRegistration) {
+				r.Scope = ""
+			},
+		},
+		{
+			name: "rotated secret brings its expiry",
+			body: `{"client_id":"client-1","client_secret":"secret-2","client_secret_expires_at":2000000000,"registration_access_token":"rat-2"}`,
+			mutate: func(r *ClientRegistration) {
+				r.ClientSecret = "secret-2"
+				r.ClientSecretExpiresAt = 2000000000
+				r.RegistrationAccessToken = "rat-2"
+			},
+		},
+		{
+			name: "explicit zero expiry without a secret keeps the secret",
+			body: `{"client_id":"client-1","client_secret_expires_at":0}`,
+			mutate: func(r *ClientRegistration) {
+				r.ClientSecretExpiresAt = 0
+			},
+		},
+		{
+			name: "explicit empty secret is cleared with its expiry",
+			body: `{"client_id":"client-1","client_secret":"","client_secret_expires_at":0}`,
+			mutate: func(r *ClientRegistration) {
+				r.ClientSecret = ""
+				r.ClientSecretExpiresAt = 0
+			},
+		},
+		{
+			name: "explicit empty registration credentials are cleared",
+			body: `{"client_id":"client-1","registration_access_token":"","registration_client_uri":""}`,
+			mutate: func(r *ClientRegistration) {
+				r.RegistrationAccessToken = ""
+				r.RegistrationClientURI = ""
+			},
+		},
+	}
+
+	for _, method := range []string{http.MethodGet, http.MethodPut} {
+		for _, tt := range tests {
+			t.Run(method+"/"+tt.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					_, _ = w.Write([]byte(tt.body))
+				}))
+				defer server.Close()
+
+				reg := previous(server.URL)
+				want := previous(server.URL)
+				tt.mutate(want)
+
+				var got *ClientRegistration
+				var err error
+				if method == http.MethodGet {
+					got, err = GetRegistration(context.Background(), reg)
+				} else {
+					got, err = UpdateRegistration(context.Background(), reg, DCRRequest{})
+				}
+				if err != nil {
+					t.Fatalf("%s failed: %v", method, err)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("registration mismatch:\n got %#v\nwant %#v", got, want)
+				}
+				if !reflect.DeepEqual(reg, previous(server.URL)) {
+					t.Errorf("input registration was modified: %#v", reg)
+				}
+			})
+		}
+	}
+}
+
+func TestManagementResponse_InvalidJSONObject(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`["not","an","object"]`))
+	}))
+	defer server.Close()
+
+	_, err := GetRegistration(context.Background(), &ClientRegistration{ClientID: "client-1", RegistrationAccessToken: "rat", RegistrationClientURI: server.URL})
+	if err == nil {
+		t.Fatal("Expected error when response is not a JSON object")
+	}
+}
+
+func TestRegisterClient_EmptyResponseFieldsFallBackToRequest(t *testing.T) {
+	regServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"client_id":"client-1","scope":"","redirect_uris":[]}`))
+	}))
+	defer regServer.Close()
+
+	reg, err := RegisterClient(context.Background(), &Discovery{
+		Issuer:               "https://auth.example.com",
+		RegistrationEndpoint: regServer.URL,
+		Scopes:               []string{"read"},
+	}, "test-server", DCRConfig{RedirectURI: "http://localhost:5000/callback"})
+	if err != nil {
+		t.Fatalf("RegisterClient failed: %v", err)
+	}
+	if reg.Scope != "read" || !reflect.DeepEqual(reg.RedirectURIs, []string{"http://localhost:5000/callback"}) {
+		t.Errorf("Expected initial registration to keep requested metadata, got %#v", reg)
+	}
+}

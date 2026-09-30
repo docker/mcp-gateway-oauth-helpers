@@ -112,8 +112,14 @@ func doRegistrationRequest(ctx context.Context, method string, reg *ClientRegist
 	if dcrResponse.ClientID != "" && dcrResponse.ClientID != reg.ClientID {
 		return nil, fmt.Errorf("client configuration response client_id %q does not match registered client_id %q", dcrResponse.ClientID, reg.ClientID)
 	}
+	// Absent members keep the previous registration; members the server sent
+	// as empty clear it.
+	present, err := parseResponseFields(respBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode client configuration response: %w", err)
+	}
 
-	return registrationFromResponse(reg.Issuer, &dcrResponse, reg), nil
+	return registrationFromResponse(reg.Issuer, &dcrResponse, reg, present), nil
 }
 
 // IsInvalidClientError reports whether an OAuth token endpoint response body

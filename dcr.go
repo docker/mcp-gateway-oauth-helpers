@@ -240,7 +240,7 @@ func RegisterClient(ctx context.Context, discovery *Discovery, serverName string
 	return registrationFromResponse(discovery.Issuer, &dcrResponse, &ClientRegistration{
 		RedirectURIs: registration.RedirectURIs,
 		Scope:        registration.Scope,
-	}), nil
+	}, nil), nil
 }
 
 // dcrHTTPClient returns the HTTP client used for registration and RFC 7592
@@ -249,35 +249,74 @@ func dcrHTTPClient() *http.Client {
 	return &http.Client{}
 }
 
+// responseFields records which members were present (and not null) in the
+// JSON object of a client information response, so that a field the server
+// left out can be told apart from one it explicitly set to an empty value.
+type responseFields map[string]bool
+
+// parseResponseFields reports the members present in a JSON object body.
+func parseResponseFields(body []byte) (responseFields, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	fields := make(responseFields, len(raw))
+	for name, value := range raw {
+		fields[name] = !bytes.Equal(bytes.TrimSpace(value), []byte("null"))
+	}
+	return fields, nil
+}
+
 // registrationFromResponse builds a ClientRegistration from an RFC 7591/7592
 // client information response. Values the server omitted are taken from
 // fallback, which must be non-nil: for a fresh registration it holds what was
 // requested, for GET/PUT it holds the previous registration.
-func registrationFromResponse(issuer string, resp *DCRResponse, fallback *ClientRegistration) *ClientRegistration {
+//
+// present says which response members were in the JSON. With it, a member
+// that is present but empty (for example "scope":"" or "redirect_uris":[]) is
+// applied as the server's cleared value, and only absent members keep the
+// fallback. With nil present, as for a fresh registration, empty values are
+// treated as omitted.
+func registrationFromResponse(issuer string, resp *DCRResponse, fallback *ClientRegistration, present responseFields) *ClientRegistration {
+	// has reports whether a member with a value should be applied.
+	has := func(name string, nonEmpty bool) bool {
+		if present == nil {
+			return nonEmpty
+		}
+		return present[name]
+	}
+
 	reg := *fallback
 	reg.Issuer = issuer
 	if reg.ClientID == "" || resp.ClientID != "" {
 		reg.ClientID = resp.ClientID
 	}
-	// The secret and its expiry describe the same credential, so they are
-	// only replaced together.
-	if resp.ClientSecret != "" || resp.ClientSecretExpiresAt != 0 {
+	// The secret and its expiry describe the same credential, so a new secret
+	// always brings its expiry (absent meaning it does not expire). An expiry
+	// sent without a secret only updates the expiry when presence is known.
+	switch {
+	case has("client_secret", resp.ClientSecret != ""):
 		reg.ClientSecret = resp.ClientSecret
 		reg.ClientSecretExpiresAt = resp.ClientSecretExpiresAt
+	case present == nil && resp.ClientSecretExpiresAt != 0:
+		reg.ClientSecret = resp.ClientSecret
+		reg.ClientSecretExpiresAt = resp.ClientSecretExpiresAt
+	case present != nil && present["client_secret_expires_at"]:
+		reg.ClientSecretExpiresAt = resp.ClientSecretExpiresAt
 	}
-	if resp.RegistrationAccessToken != "" {
+	if has("registration_access_token", resp.RegistrationAccessToken != "") {
 		reg.RegistrationAccessToken = resp.RegistrationAccessToken
 	}
-	if resp.RegistrationClientURI != "" {
+	if has("registration_client_uri", resp.RegistrationClientURI != "") {
 		reg.RegistrationClientURI = resp.RegistrationClientURI
 	}
-	if len(resp.RedirectURIs) > 0 {
+	if has("redirect_uris", len(resp.RedirectURIs) > 0) {
 		reg.RedirectURIs = resp.RedirectURIs
 	}
-	if resp.Scope != "" {
+	if has("scope", resp.Scope != "") {
 		reg.Scope = resp.Scope
 	}
-	if resp.TokenEndpointAuthMethod != "" {
+	if has("token_endpoint_auth_method", resp.TokenEndpointAuthMethod != "") {
 		reg.TokenEndpointAuthMethod = resp.TokenEndpointAuthMethod
 	}
 	return &reg
