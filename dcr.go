@@ -117,7 +117,32 @@ func PerformDCR(ctx context.Context, discovery *Discovery, serverName string, re
 }
 
 // PerformDCRWithConfig performs Dynamic Client Registration with configurable DCR behavior.
+// It is a thin wrapper over RegisterClient that keeps only the client credentials.
 func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName string, config DCRConfig) (*ClientCredentials, error) {
+	reg, err := RegisterClient(ctx, discovery, serverName, config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create client credentials (public client - no secret)
+	return &ClientCredentials{
+		ClientID:              reg.ClientID,
+		ServerURL:             discovery.ResourceURL,
+		IsPublic:              true,
+		AuthorizationEndpoint: discovery.AuthorizationEndpoint,
+		TokenEndpoint:         discovery.TokenEndpoint,
+		// No ClientSecret for public clients
+	}, nil
+}
+
+// RegisterClient performs Dynamic Client Registration (RFC 7591) and returns the
+// full registration, including the RFC 7592 management credentials
+// (registration_access_token / registration_client_uri) when the server issues
+// them. The result is suitable for persisting and later reuse.
+//
+// Redirect URI handling and the registered client metadata are identical to
+// PerformDCRWithConfig.
+func RegisterClient(ctx context.Context, discovery *Discovery, serverName string, config DCRConfig) (*ClientRegistration, error) {
 	if discovery.RegistrationEndpoint == "" {
 		return nil, fmt.Errorf("no registration endpoint found for %s", serverName)
 	}
@@ -170,7 +195,10 @@ func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName 
 	req.Header.Set("User-Agent", "MCP-Gateway/1.0.0")
 
 	// Send the request
-	client := &http.Client{}
+	client, err := dcrHTTPClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DCR HTTP client: %w", err)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send DCR request to %s: %w", discovery.RegistrationEndpoint, err)
@@ -180,7 +208,7 @@ func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName 
 	// Check response status (201 Created or 200 OK are acceptable)
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		// Read error response body to understand why DCR failed
-		errorBody, err := io.ReadAll(resp.Body)
+		errorBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRegistrationResponseBytes))
 		if err != nil {
 			return nil, fmt.Errorf("DCR failed with status %d for %s", resp.StatusCode, serverName)
 		}
@@ -200,12 +228,12 @@ func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName 
 			}
 		}
 
-		return nil, fmt.Errorf("DCR failed with status %d for %s: %s", resp.StatusCode, serverName, errorMsg)
+		return nil, fmt.Errorf("DCR failed with status %d for %s: %s", resp.StatusCode, serverName, truncateForError(errorMsg))
 	}
 
 	// Parse the response
 	var dcrResponse DCRResponse
-	if err := json.NewDecoder(resp.Body).Decode(&dcrResponse); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRegistrationResponseBytes)).Decode(&dcrResponse); err != nil {
 		return nil, fmt.Errorf("failed to decode DCR response: %w", err)
 	}
 
@@ -213,17 +241,113 @@ func PerformDCRWithConfig(ctx context.Context, discovery *Discovery, serverName 
 		return nil, fmt.Errorf("DCR response missing client_id for %s", serverName)
 	}
 
-	// Create client credentials (public client - no secret)
-	creds := &ClientCredentials{
-		ClientID:              dcrResponse.ClientID,
-		ServerURL:             discovery.ResourceURL,
-		IsPublic:              true,
-		AuthorizationEndpoint: discovery.AuthorizationEndpoint,
-		TokenEndpoint:         discovery.TokenEndpoint,
-		// No ClientSecret for public clients
+	return registrationFromResponse(discovery.Issuer, &dcrResponse, &ClientRegistration{
+		RedirectURIs: registration.RedirectURIs,
+		Scope:        registration.Scope,
+	}, nil), nil
+}
+
+// dcrHTTPClient returns the HTTP client used for registration and RFC 7592
+// client configuration requests. It is the authorization-server guarded client
+// (https requirement, dial-time address pinning, advisory SSRF warnings, and
+// the WithSkipSSRFCheck / WithAllowLocalHTTP / environment opt-outs), bounded
+// by registrationRequestTimeout. The caller's context deadline still applies.
+func dcrHTTPClient(ctx context.Context) (*http.Client, error) {
+	base := httpClientFunc()
+	if base == nil {
+		return nil, fmt.Errorf("HTTP client is nil")
+	}
+	if base.Timeout == 0 {
+		// Copy before modifying: the func may hand out a shared client.
+		withTimeout := *base
+		withTimeout.Timeout = registrationRequestTimeout
+		base = &withTimeout
+	}
+	return authorizationServerHTTPClientFunc(ctx, base)
+}
+
+// truncateForError bounds text that originates from a remote server before it
+// is placed in an error, so a hostile server cannot use error messages to
+// carry a large response back to the caller.
+func truncateForError(text string) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= maxErrorBodyBytes {
+		return text
+	}
+	return strings.ToValidUTF8(text[:maxErrorBodyBytes], "") + "... (truncated)"
+}
+
+// responseFields records which members were present (and not null) in the
+// JSON object of a client information response, so that a field the server
+// left out can be told apart from one it explicitly set to an empty value.
+type responseFields map[string]bool
+
+// parseResponseFields reports the members present in a JSON object body.
+func parseResponseFields(body []byte) (responseFields, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	fields := make(responseFields, len(raw))
+	for name, value := range raw {
+		fields[name] = !bytes.Equal(bytes.TrimSpace(value), []byte("null"))
+	}
+	return fields, nil
+}
+
+// registrationFromResponse builds a ClientRegistration from an RFC 7591/7592
+// client information response. Values the server omitted are taken from
+// fallback, which must be non-nil: for a fresh registration it holds what was
+// requested, for GET/PUT it holds the previous registration.
+//
+// present says which response members were in the JSON. With it, a member
+// that is present but empty (for example "scope":"" or "redirect_uris":[]) is
+// applied as the server's cleared value, and only absent members keep the
+// fallback. With nil present, as for a fresh registration, empty values are
+// treated as omitted.
+func registrationFromResponse(issuer string, resp *DCRResponse, fallback *ClientRegistration, present responseFields) *ClientRegistration {
+	// has reports whether a member with a value should be applied.
+	has := func(name string, nonEmpty bool) bool {
+		if present == nil {
+			return nonEmpty
+		}
+		return present[name]
 	}
 
-	return creds, nil
+	reg := *fallback
+	reg.Issuer = issuer
+	if reg.ClientID == "" || resp.ClientID != "" {
+		reg.ClientID = resp.ClientID
+	}
+	// The secret and its expiry describe the same credential, so a new secret
+	// always brings its expiry (absent meaning it does not expire). An expiry
+	// sent without a secret only updates the expiry when presence is known.
+	switch {
+	case has("client_secret", resp.ClientSecret != ""):
+		reg.ClientSecret = resp.ClientSecret
+		reg.ClientSecretExpiresAt = resp.ClientSecretExpiresAt
+	case present == nil && resp.ClientSecretExpiresAt != 0:
+		reg.ClientSecret = resp.ClientSecret
+		reg.ClientSecretExpiresAt = resp.ClientSecretExpiresAt
+	case present != nil && present["client_secret_expires_at"]:
+		reg.ClientSecretExpiresAt = resp.ClientSecretExpiresAt
+	}
+	if has("registration_access_token", resp.RegistrationAccessToken != "") {
+		reg.RegistrationAccessToken = resp.RegistrationAccessToken
+	}
+	if has("registration_client_uri", resp.RegistrationClientURI != "") {
+		reg.RegistrationClientURI = resp.RegistrationClientURI
+	}
+	if has("redirect_uris", len(resp.RedirectURIs) > 0) {
+		reg.RedirectURIs = resp.RedirectURIs
+	}
+	if has("scope", resp.Scope != "") {
+		reg.Scope = resp.Scope
+	}
+	if has("token_endpoint_auth_method", resp.TokenEndpointAuthMethod != "") {
+		reg.TokenEndpointAuthMethod = resp.TokenEndpointAuthMethod
+	}
+	return &reg
 }
 
 // joinScopes joins a slice of scopes into a space-separated string
