@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -70,9 +71,20 @@ func DiscoverOAuthRequirements(ctx context.Context, serverURL string) (*Discover
 	if clientName == "" {
 		clientName = "mcp-gateway"
 	}
-	encodedName, _ := json.Marshal(clientName)
-	mcpPayload := fmt.Sprintf(`{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":%s,"version":"1.0.0"}},"id":1}`, encodedName)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL, strings.NewReader(mcpPayload))
+	mcpPayload, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "initialize",
+		"id":      1,
+		"params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{},
+			"clientInfo": map[string]string{
+				"name":    clientName,
+				"version": "1.0.0",
+			},
+		},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL, bytes.NewReader(mcpPayload))
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
