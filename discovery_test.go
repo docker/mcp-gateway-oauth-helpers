@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -642,6 +645,174 @@ func TestAuthorizationServerClientWarnsOnRedirectToPrivateAddress(t *testing.T) 
 	}
 	if !logger.containsWarn("169.254.0.0/16") {
 		t.Fatalf("expected a warning naming the blocked redirect target, got: %v", logger.warns)
+	}
+}
+
+// newConnectProxy starts an HTTP proxy that tunnels every CONNECT to target,
+// whatever host was requested, and reports the requested authorities.
+func newConnectProxy(t *testing.T, target string) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var authorities []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT only", http.StatusMethodNotAllowed)
+			return
+		}
+		mu.Lock()
+		authorities = append(authorities, r.Host)
+		mu.Unlock()
+		upstream, err := (&net.Dialer{}).DialContext(r.Context(), "tcp", target)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		w.WriteHeader(http.StatusOK)
+		client, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		go func() { _, _ = io.Copy(upstream, client) }()
+		_, _ = io.Copy(client, upstream)
+	}))
+	t.Cleanup(proxy.Close)
+	return proxy, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(authorities)
+	}
+}
+
+// TestAuthorizationServerClientKeepsCallerProxy covers hosts whose only
+// egress is a proxy: the authorization server host does not resolve locally,
+// so the request succeeds only if it goes through the caller's proxy.
+func TestAuthorizationServerClientKeepsCallerProxy(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("proxied auth server response"))
+	}))
+	defer authServer.Close()
+	proxy, authorities := newConnectProxy(t, authServer.Listener.Addr().String())
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parsing proxy URL: %v", err)
+	}
+
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(context.Background(), baseClient, staticResolver{})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expected the request to go through the proxy, got error: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	if string(body) != "proxied auth server response" {
+		t.Fatalf("expected the proxied response, got %q", body)
+	}
+	if got := authorities(); !slices.Equal(got, []string{"auth.example.com:443"}) {
+		t.Fatalf("expected one CONNECT to auth.example.com:443, got %v", got)
+	}
+}
+
+func TestAuthorizationServerClientWarnsOnPrivateHostThroughProxy(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer authServer.Close()
+	proxy, authorities := newConnectProxy(t, authServer.Listener.Addr().String())
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parsing proxy URL: %v", err)
+	}
+
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(context.Background(), baseClient, staticResolver{})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	logger := &testLogger{}
+	req, err := http.NewRequestWithContext(WithLogger(context.Background(), logger), http.MethodGet, "https://169.254.169.254/latest/meta-data", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expected the proxied request to proceed anyway, got error: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := authorities(); !slices.Equal(got, []string{"169.254.169.254:443"}) {
+		t.Fatalf("expected one CONNECT to 169.254.169.254:443, got %v", got)
+	}
+	if !logger.containsWarn("169.254.0.0/16") {
+		t.Fatalf("expected a warning naming the blocked range, got: %v", logger.warns)
+	}
+}
+
+func TestAuthorizationServerClientPinsWhenProxyDeclinesRequest(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer authServer.Close()
+
+	var dialedAddress string
+	dialer := &net.Dialer{}
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           func(*http.Request) (*url.URL, error) { return nil, nil }, //nolint:nilnil // A nil proxy URL means a direct connection.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				dialedAddress = address
+				return dialer.DialContext(ctx, network, authServer.Listener.Addr().String())
+			},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(context.Background(), baseClient, staticResolver{
+		"auth.example.com": {netip.MustParseAddr("93.184.216.34")},
+	})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expected the direct request to succeed, got error: %v", err)
+	}
+	defer resp.Body.Close()
+	if dialedAddress != "93.184.216.34:443" {
+		t.Fatalf("expected the resolved public IP to be pinned, got %q", dialedAddress)
 	}
 }
 
