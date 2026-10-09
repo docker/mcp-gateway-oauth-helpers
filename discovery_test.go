@@ -662,7 +662,7 @@ func newConnectProxy(t *testing.T, target string) (*httptest.Server, func() []st
 		mu.Lock()
 		authorities = append(authorities, r.Host)
 		mu.Unlock()
-		upstream, err := net.Dial("tcp", target)
+		upstream, err := (&net.Dialer{}).DialContext(r.Context(), "tcp", target)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -712,7 +712,11 @@ func TestAuthorizationServerClientKeepsCallerProxy(t *testing.T) {
 		t.Fatalf("creating guarded client: %v", err)
 	}
 
-	resp, err := client.Get("https://auth.example.com/.well-known/oauth-authorization-server")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("expected the request to go through the proxy, got error: %v", err)
 	}
@@ -783,7 +787,7 @@ func TestAuthorizationServerClientPinsWhenProxyDeclinesRequest(t *testing.T) {
 	dialer := &net.Dialer{}
 	baseClient := &http.Client{
 		Transport: &http.Transport{
-			Proxy:           func(*http.Request) (*url.URL, error) { return nil, nil },
+			Proxy:           func(*http.Request) (*url.URL, error) { return nil, nil }, //nolint:nilnil // A nil proxy URL means a direct connection.
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 				dialedAddress = address
@@ -798,7 +802,11 @@ func TestAuthorizationServerClientPinsWhenProxyDeclinesRequest(t *testing.T) {
 		t.Fatalf("creating guarded client: %v", err)
 	}
 
-	resp, err := client.Get("https://auth.example.com/.well-known/oauth-authorization-server")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("expected the direct request to succeed, got error: %v", err)
 	}
