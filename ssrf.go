@@ -128,6 +128,11 @@ var authorizationServerHTTPClientFunc = newAuthorizationServerHTTPClient
 // proceeds anyway, unless the context carries WithSkipSSRFCheck, in which
 // case the check is skipped entirely (no checks, no warning). The guarded
 // transport is also used for every redirect.
+//
+// A request the caller's transport routes through a proxy keeps that proxy:
+// the proxy resolves and dials the target itself, so a dial-time pin would
+// only vet the proxy's address while a direct connection fails on hosts whose
+// only egress is the proxy. Such requests get the URL checks alone.
 func newAuthorizationServerHTTPClient(ctx context.Context, client *http.Client) (*http.Client, error) {
 	return newAuthorizationServerHTTPClientWithResolver(ctx, client, net.DefaultResolver)
 }
@@ -158,9 +163,7 @@ func newAuthorizationServerHTTPClientWithResolver(ctx context.Context, client *h
 		guardedTransport.DialTLSContext != nil {
 		return nil, fmt.Errorf("HTTP transport with a custom TLS dialer cannot be guarded at dial time")
 	}
-	// A generic proxy cannot guarantee that the validated address is the one
-	// ultimately dialed. Authorization-server discovery therefore uses a direct
-	// connection whose resolved public address is pinned below.
+	proxiedTransport := guardedTransport.Clone()
 	guardedTransport.Proxy = nil
 
 	originalDialContext := guardedTransport.DialContext
@@ -175,13 +178,21 @@ func newAuthorizationServerHTTPClientWithResolver(ctx context.Context, client *h
 		return dialPublicAddress(ctx, resolver, originalDialContext, network, host, port)
 	}
 
+	guarded := &publicOnlyRoundTripper{base: guardedTransport}
+	if transport.Proxy != nil {
+		guarded.proxy = transport.Proxy
+		guarded.proxied = proxiedTransport
+	}
+
 	guardedClient := *client
-	guardedClient.Transport = &publicOnlyRoundTripper{base: guardedTransport}
+	guardedClient.Transport = guarded
 	return &guardedClient, nil
 }
 
 type publicOnlyRoundTripper struct {
-	base http.RoundTripper
+	base    http.RoundTripper
+	proxy   func(*http.Request) (*url.URL, error)
+	proxied http.RoundTripper
 }
 
 func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -194,6 +205,15 @@ func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		safeErr := sanitizeForLog(ssrfErr.Error())
 		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %s", safeURL, safeErr)
 		recordSSRFRejection(req.Context(), fmt.Sprintf("authorization server request to %s was rejected by the SSRF guard: %s", safeURL, safeErr))
+	}
+	if t.proxy != nil {
+		proxyURL, err := t.proxy(req)
+		if err != nil {
+			return nil, err
+		}
+		if proxyURL != nil {
+			return t.proxied.RoundTrip(req)
+		}
 	}
 	return t.base.RoundTrip(req)
 }
