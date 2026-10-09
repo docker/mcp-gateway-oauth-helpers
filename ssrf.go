@@ -164,6 +164,7 @@ func newAuthorizationServerHTTPClientWithResolver(ctx context.Context, client *h
 		return nil, fmt.Errorf("HTTP transport with a custom TLS dialer cannot be guarded at dial time")
 	}
 	proxiedTransport := guardedTransport.Clone()
+	proxiedTransport.Proxy = selectedProxy
 	guardedTransport.Proxy = nil
 
 	originalDialContext := guardedTransport.DialContext
@@ -212,10 +213,24 @@ func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 			return nil, err
 		}
 		if proxyURL != nil {
-			return t.proxied.RoundTrip(req)
+			return t.proxied.RoundTrip(req.WithContext(context.WithValue(req.Context(), selectedProxyKey{}, proxyURL)))
 		}
 	}
 	return t.base.RoundTrip(req)
+}
+
+// selectedProxyKey carries the proxy publicOnlyRoundTripper chose for a
+// request, so the proxied transport uses that choice instead of asking the
+// caller's selector again: a selector that answered "direct" on a second call
+// would otherwise send the request out on an unpinned direct dial.
+type selectedProxyKey struct{}
+
+func selectedProxy(req *http.Request) (*url.URL, error) {
+	proxyURL, _ := req.Context().Value(selectedProxyKey{}).(*url.URL)
+	if proxyURL == nil {
+		return nil, fmt.Errorf("authorization server request reached the proxied transport without a selected proxy")
+	}
+	return proxyURL, nil
 }
 
 // validatePublicHTTPSURL enforces the always-hard requirements for an
