@@ -733,6 +733,56 @@ func TestAuthorizationServerClientKeepsCallerProxy(t *testing.T) {
 	}
 }
 
+// TestAuthorizationServerClientUsesFirstProxyDecision covers a proxy selector
+// whose answer changes between calls: the request must still go through the
+// proxy chosen first rather than falling back to an unpinned direct dial.
+func TestAuthorizationServerClientUsesFirstProxyDecision(t *testing.T) {
+	t.Setenv(allowInsecureRemoteURLEnv, "")
+
+	authServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer authServer.Close()
+	proxy, authorities := newConnectProxy(t, authServer.Listener.Addr().String())
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parsing proxy URL: %v", err)
+	}
+
+	var selections atomic.Int32
+	baseClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: func(*http.Request) (*url.URL, error) {
+				if selections.Add(1) == 1 {
+					return proxyURL, nil
+				}
+				return nil, nil //nolint:nilnil // A nil proxy URL means a direct connection.
+			},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	client, err := newAuthorizationServerHTTPClientWithResolver(context.Background(), baseClient, staticResolver{})
+	if err != nil {
+		t.Fatalf("creating guarded client: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://auth.example.com/.well-known/oauth-authorization-server", nil)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expected the request to go through the first-selected proxy, got error: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := authorities(); !slices.Equal(got, []string{"auth.example.com:443"}) {
+		t.Fatalf("expected one CONNECT to auth.example.com:443, got %v", got)
+	}
+	if got := selections.Load(); got != 1 {
+		t.Fatalf("expected the proxy selector to be called once, got %d", got)
+	}
+}
+
 func TestAuthorizationServerClientWarnsOnPrivateHostThroughProxy(t *testing.T) {
 	t.Setenv(allowInsecureRemoteURLEnv, "")
 
