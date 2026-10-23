@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // setupTestHTTPClient configures httpClientFunc to accept test TLS certificates
@@ -669,12 +671,13 @@ func newConnectProxy(t *testing.T, target string) (*httptest.Server, func() []st
 		}
 		defer upstream.Close()
 		w.WriteHeader(http.StatusOK)
-		client, _, err := w.(http.Hijacker).Hijack()
+		client, buffered, err := w.(http.Hijacker).Hijack()
 		if err != nil {
 			return
 		}
 		defer client.Close()
-		go func() { _, _ = io.Copy(upstream, client) }()
+		// Hijack may return tunnel bytes already read from the connection.
+		go func() { _, _ = io.Copy(upstream, buffered.Reader) }()
 		_, _ = io.Copy(client, upstream)
 	}))
 	t.Cleanup(proxy.Close)
@@ -682,6 +685,54 @@ func newConnectProxy(t *testing.T, target string) (*httptest.Server, func() []st
 		mu.Lock()
 		defer mu.Unlock()
 		return slices.Clone(authorities)
+	}
+}
+
+// Tunnel data may already be buffered when the proxy hijacks the connection.
+func TestConnectProxyPreservesBufferedTunnelData(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "tunneled response")
+	}))
+	defer upstream.Close()
+	proxy, _ := newConnectProxy(t, upstream.Listener.Addr().String())
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", proxyURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// One write makes net/http read tunnel bytes alongside the CONNECT headers.
+	_, err = io.WriteString(conn, "CONNECT auth.example.com:443 HTTP/1.1\r\nHost: auth.example.com:443\r\n\r\n"+
+		"GET / HTTP/1.1\r\nHost: auth.example.com\r\nConnection: close\r\n\r\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	connected, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connected.Body.Close()
+	if connected.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT returned %s", connected.Status)
+	}
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("reading tunneled response: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "tunneled response" {
+		t.Fatalf("unexpected tunneled response: %q", body)
 	}
 }
 
