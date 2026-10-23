@@ -1,11 +1,11 @@
 #syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.24.5
+ARG GO_VERSION=1.26.10
 
-FROM --platform=${BUILDPLATFORM} golangci/golangci-lint:v2.1.6-alpine AS lint-base
+FROM --platform=${BUILDPLATFORM} golangci/golangci-lint:v2.15.0-alpine AS lint-base
 
-FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION}-alpine AS base
-RUN apk add --no-cache git rsync
+FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION}-alpine3.23 AS base
+RUN apk add --no-cache git rsync 'ca-certificates>=20261020-r0'
 WORKDIR /app
 
 FROM base AS lint
