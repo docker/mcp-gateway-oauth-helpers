@@ -24,7 +24,7 @@ func TestHTTPRouteSelectorIsolatesHTTPProtocols(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			newOrigin := func(label string) *httptest.Server {
-				s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					_, _ = io.WriteString(w, label)
 				}))
 				s.EnableHTTP2 = useHTTP2
@@ -34,7 +34,7 @@ func TestHTTPRouteSelectorIsolatesHTTPProtocols(t *testing.T) {
 			}
 			first, second := newOrigin("first"), newOrigin("second")
 			var selections int
-			ctx := WithHTTPRouteSelector(context.Background(), func(req *http.Request, base *http.Transport) (*http.Transport, bool, error) {
+			ctx := WithHTTPRouteSelector(context.Background(), func(_ *http.Request, base *http.Transport) (*http.Transport, bool, error) {
 				origin := first
 				if selections%2 != 0 {
 					origin = second
@@ -90,7 +90,7 @@ func TestHTTPRouteSelectorDirectAdvisoryAndSkip(t *testing.T) {
 			name = "skip"
 		}
 		t.Run(name, func(t *testing.T) {
-			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = io.WriteString(w, "metadata")
 			}))
 			defer origin.Close()
@@ -100,7 +100,7 @@ func TestHTTPRouteSelectorDirectAdvisoryAndSkip(t *testing.T) {
 				ctx = WithSkipSSRFCheck(ctx)
 			}
 			var dialed string
-			ctx = WithHTTPRouteSelector(ctx, func(req *http.Request, base *http.Transport) (*http.Transport, bool, error) {
+			ctx = WithHTTPRouteSelector(ctx, func(_ *http.Request, base *http.Transport) (*http.Transport, bool, error) {
 				base.Proxy = nil
 				base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 					dialed = address
@@ -154,7 +154,7 @@ func TestHTTPRouteSelectorRunsForRedirect(t *testing.T) {
 	ctx := WithHTTPRouteSelector(context.Background(), func(req *http.Request, base *http.Transport) (*http.Transport, bool, error) {
 		destinations = append(destinations, req.URL.Host)
 		base.Proxy = nil
-		base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
 		}
 		return base, true, nil
@@ -202,16 +202,16 @@ func TestHTTPRouteSelectorReleasesTransport(t *testing.T) {
 		{name: "http2-eof", readEOF: true, http2: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
-			origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = io.WriteString(w, strings.Repeat("x", 4096))
 			}))
 			origin.EnableHTTP2 = scenario.http2
 			origin.StartTLS()
 			defer origin.Close()
 			connections := make(chan *routeObservedConn, 1)
-			ctx := WithHTTPRouteSelector(context.Background(), func(req *http.Request, base *http.Transport) (*http.Transport, bool, error) {
+			ctx := WithHTTPRouteSelector(context.Background(), func(_ *http.Request, base *http.Transport) (*http.Transport, bool, error) {
 				base.Proxy = nil
-				base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 					conn, err := (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
 					if err != nil {
 						return nil, err
@@ -264,7 +264,7 @@ func TestHTTPRouteSelectorFailureDoesNotFallBack(t *testing.T) {
 		dials.Add(1)
 		return nil, errors.New("unexpected fallback")
 	}}
-	ctx := WithHTTPRouteSelector(context.Background(), func(req *http.Request, owned *http.Transport) (*http.Transport, bool, error) {
+	ctx := WithHTTPRouteSelector(context.Background(), func(_ *http.Request, owned *http.Transport) (*http.Transport, bool, error) {
 		if owned == base {
 			t.Fatal("selector received shared transport")
 		}
@@ -318,7 +318,7 @@ func TestHTTPRouteSelectorRejectsInvalidRoutes(t *testing.T) {
 func TestHTTPRouteSelectorRoundTripError(t *testing.T) {
 	sentinel := errors.New("captured route unavailable")
 	var selections atomic.Int32
-	ctx := WithHTTPRouteSelector(context.Background(), func(req *http.Request, base *http.Transport) (*http.Transport, bool, error) {
+	ctx := WithHTTPRouteSelector(context.Background(), func(_ *http.Request, base *http.Transport) (*http.Transport, bool, error) {
 		selections.Add(1)
 		base.Proxy = nil
 		base.DialContext = func(context.Context, string, string) (net.Conn, error) {

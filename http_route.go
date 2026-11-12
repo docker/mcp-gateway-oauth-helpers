@@ -86,7 +86,8 @@ func (t *routedAuthorizationServerTransport) RoundTrip(req *http.Request) (*http
 	}
 	transport.DisableKeepAlives = true
 	if t.guard && !upstreamResolvesTarget {
-		if transport.DialTLS != nil || transport.DialTLSContext != nil {
+		if transport.DialTLS != nil || //nolint:staticcheck // A legacy TLS dialer would bypass the guarded DialContext.
+			transport.DialTLSContext != nil {
 			transport.CloseIdleConnections()
 			return nil, fmt.Errorf("HTTP transport with a custom TLS dialer cannot be guarded at dial time")
 		}
