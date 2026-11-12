@@ -141,6 +141,9 @@ func newAuthorizationServerHTTPClientWithResolver(ctx context.Context, client *h
 	if client == nil {
 		return nil, fmt.Errorf("HTTP client is nil")
 	}
+	if selector, _ := ctx.Value(httpRouteSelectorKey{}).(HTTPRouteSelector); selector != nil {
+		return newRoutedAuthorizationServerHTTPClient(ctx, client, resolver, selector)
+	}
 	if allowInsecureRemoteURLs() || skipSSRFCheck(ctx) {
 		insecureClient := *client
 		return &insecureClient, nil
@@ -197,15 +200,8 @@ type publicOnlyRoundTripper struct {
 }
 
 func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	ssrfErr, err := validatePublicHTTPSURL(req.Context(), req.URL)
-	if err != nil {
+	if err := checkAuthorizationServerRequest(req); err != nil {
 		return nil, err
-	}
-	if ssrfErr != nil {
-		safeURL := sanitizeForLog(req.URL.String())
-		safeErr := sanitizeForLog(ssrfErr.Error())
-		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %s", safeURL, safeErr)
-		recordSSRFRejection(req.Context(), fmt.Sprintf("authorization server request to %s was rejected by the SSRF guard: %s", safeURL, safeErr))
 	}
 	if t.proxy != nil {
 		proxyURL, err := t.proxy(req)
@@ -217,6 +213,20 @@ func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		}
 	}
 	return t.base.RoundTrip(req)
+}
+
+func checkAuthorizationServerRequest(req *http.Request) error {
+	ssrfErr, err := validatePublicHTTPSURL(req.Context(), req.URL)
+	if err != nil {
+		return err
+	}
+	if ssrfErr != nil {
+		safeURL := sanitizeForLog(req.URL.String())
+		safeErr := sanitizeForLog(ssrfErr.Error())
+		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %s", safeURL, safeErr)
+		recordSSRFRejection(req.Context(), fmt.Sprintf("authorization server request to %s was rejected by the SSRF guard: %s", safeURL, safeErr))
+	}
+	return nil
 }
 
 // selectedProxyKey carries the proxy publicOnlyRoundTripper chose for a
