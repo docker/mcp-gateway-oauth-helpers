@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/docker/mcp-gateway-oauth-helpers/transportdial"
 )
 
 const allowInsecureRemoteURLEnv = "DOCKER_MCP_ALLOW_INSECURE_REMOTE_URLS"
@@ -134,12 +136,19 @@ var authorizationServerHTTPClientFunc = newAuthorizationServerHTTPClient
 // only vet the proxy's address while a direct connection fails on hosts whose
 // only egress is the proxy. Such requests get the URL checks alone.
 func newAuthorizationServerHTTPClient(ctx context.Context, client *http.Client) (*http.Client, error) {
-	return newAuthorizationServerHTTPClientWithResolver(ctx, client, net.DefaultResolver)
+	resolver, _ := ctx.Value(httpResolverKey{}).(*net.Resolver)
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	return newAuthorizationServerHTTPClientWithResolver(ctx, client, resolver)
 }
 
 func newAuthorizationServerHTTPClientWithResolver(ctx context.Context, client *http.Client, resolver ipResolver) (*http.Client, error) {
 	if client == nil {
 		return nil, fmt.Errorf("HTTP client is nil")
+	}
+	if selector, _ := ctx.Value(httpRouteSelectorKey{}).(HTTPRouteSelector); selector != nil {
+		return newRoutedAuthorizationServerHTTPClient(ctx, client, resolver, selector)
 	}
 	if allowInsecureRemoteURLs() || skipSSRFCheck(ctx) {
 		insecureClient := *client
@@ -158,48 +167,53 @@ func newAuthorizationServerHTTPClientWithResolver(ctx context.Context, client *h
 		return nil, fmt.Errorf("HTTP transport %T cannot be guarded at dial time", base)
 	}
 
-	guardedTransport := transport.Clone()
-	if guardedTransport.DialTLS != nil || //nolint:staticcheck // A legacy TLS dialer would bypass the guarded DialContext.
-		guardedTransport.DialTLSContext != nil {
+	if transport.DialTLS != nil || //nolint:staticcheck // TLS dialers bypass direct address pinning.
+		transport.DialTLSContext != nil {
 		return nil, fmt.Errorf("HTTP transport with a custom TLS dialer cannot be guarded at dial time")
 	}
-	proxiedTransport := guardedTransport.Clone()
-	proxiedTransport.Proxy = selectedProxy
-	guardedTransport.Proxy = nil
-
-	originalDialContext := guardedTransport.DialContext
-	if originalDialContext == nil {
-		originalDialContext = (&net.Dialer{}).DialContext
+	if transport.DialContext == nil && transport.Dial != nil { //nolint:staticcheck // Legacy dialing cannot honor operation cancellation.
+		return nil, fmt.Errorf("HTTP transport requires DialContext for custom dialing")
 	}
-	guardedTransport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, fmt.Errorf("invalid authorization server dial address %q: %w", address, err)
+	proxy := transport.Proxy
+	selector := func(req *http.Request, owned *http.Transport) (*http.Transport, bool, error) {
+		owned.Proxy = nil
+		if proxy != nil {
+			selected, err := proxy(req)
+			if err != nil {
+				return owned, false, err
+			}
+			if selected != nil {
+				owned.Proxy = http.ProxyURL(selected)
+				return owned, true, nil
+			}
 		}
-		return dialPublicAddress(ctx, resolver, originalDialContext, network, host, port)
+		return owned, false, nil
 	}
-
-	guarded := &publicOnlyRoundTripper{base: guardedTransport}
-	if transport.Proxy != nil {
-		guarded.proxy = transport.Proxy
-		guarded.proxied = proxiedTransport
+	routed := &routedAuthorizationServerTransport{
+		base: transport, selector: selector, resolver: resolver, guard: true,
+		dialTimeout: connectionTimeout(client), allowSelectedProxy: true, urlChecked: true,
 	}
-
 	guardedClient := *client
-	guardedClient.Transport = guarded
+	guardedClient.Transport = &publicOnlyRoundTripper{base: routed}
 	return &guardedClient, nil
 }
 
-type publicOnlyRoundTripper struct {
-	base    http.RoundTripper
-	proxy   func(*http.Request) (*url.URL, error)
-	proxied http.RoundTripper
-}
+type publicOnlyRoundTripper struct{ base http.RoundTripper }
 
 func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := checkAuthorizationServerRequest(req); err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err
+	}
+	return t.base.RoundTrip(req)
+}
+
+func checkAuthorizationServerRequest(req *http.Request) error {
 	ssrfErr, err := validatePublicHTTPSURL(req.Context(), req.URL)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if ssrfErr != nil {
 		safeURL := sanitizeForLog(req.URL.String())
@@ -207,30 +221,7 @@ func (t *publicOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		loggerFromContext(req.Context()).Warnf("authorization server request to %s was rejected by the SSRF guard; proceeding anyway: %s", safeURL, safeErr)
 		recordSSRFRejection(req.Context(), fmt.Sprintf("authorization server request to %s was rejected by the SSRF guard: %s", safeURL, safeErr))
 	}
-	if t.proxy != nil {
-		proxyURL, err := t.proxy(req)
-		if err != nil {
-			return nil, err
-		}
-		if proxyURL != nil {
-			return t.proxied.RoundTrip(req.WithContext(context.WithValue(req.Context(), selectedProxyKey{}, proxyURL)))
-		}
-	}
-	return t.base.RoundTrip(req)
-}
-
-// selectedProxyKey carries the proxy publicOnlyRoundTripper chose for a
-// request, so the proxied transport uses that choice instead of asking the
-// caller's selector again: a selector that answered "direct" on a second call
-// would otherwise send the request out on an unpinned direct dial.
-type selectedProxyKey struct{}
-
-func selectedProxy(req *http.Request) (*url.URL, error) {
-	proxyURL, _ := req.Context().Value(selectedProxyKey{}).(*url.URL)
-	if proxyURL == nil {
-		return nil, fmt.Errorf("authorization server request reached the proxied transport without a selected proxy")
-	}
-	return proxyURL, nil
+	return nil
 }
 
 // validatePublicHTTPSURL enforces the always-hard requirements for an
@@ -275,28 +266,34 @@ func validatePublicHTTPSURL(ctx context.Context, target *url.URL) (ssrfErr, hard
 	return nil, nil
 }
 
-// dialPublicAddress pins the dial to the address(es) validated above,
-// closing the DNS-rebinding gap where a hostname could resolve differently
-// between the RoundTrip-time check and the actual dial. A disallowed address
-// is logged as a warning (naming the host/address) rather than rejected: the
-// dial proceeds against the real, rejected address exactly like every other
-// authorization-server SSRF rejection in this package.
-func dialPublicAddress(
+// dialResolvedAddress checks the complete DNS snapshot before connecting to its
+// literal addresses. Guard rejections are advisory; skipped checks emit nothing.
+func dialResolvedAddress(
 	ctx context.Context,
 	resolver ipResolver,
 	dial func(context.Context, string, string) (net.Conn, error),
 	network, host, port string,
+	guard bool,
 ) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	logger := loggerFromContext(ctx)
+	validate := func(ip netip.Addr) error {
+		if !guard {
+			return nil
+		}
+		return validateDialAddr(ctx, ip)
+	}
 
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if err := validateDialAddr(ctx, ip); err != nil {
+		if err := validate(ip); err != nil {
 			safeIP := sanitizeForLog(ip.String())
 			safeErr := sanitizeForLog(err.Error())
 			logger.Warnf("authorization server dial address %s was rejected by the SSRF guard; dialing anyway: %s", safeIP, safeErr)
 			recordSSRFRejection(ctx, fmt.Sprintf("authorization server dial address %s was rejected by the SSRF guard: %s", safeIP, safeErr))
 		}
-		return dial(ctx, network, net.JoinHostPort(ip.String(), port))
+		return transportdial.DialAddresses(ctx, network, port, []netip.Addr{ip}, dial)
 	}
 
 	ips, err := resolver.LookupNetIP(ctx, "ip", host)
@@ -307,7 +304,7 @@ func dialPublicAddress(
 		return nil, fmt.Errorf("authorization server host %q did not resolve to any IP addresses", host)
 	}
 	for _, ip := range ips {
-		if err := validateDialAddr(ctx, ip); err != nil {
+		if err := validate(ip); err != nil {
 			safeHost := sanitizeForLog(host)
 			safeIP := sanitizeForLog(ip.String())
 			safeErr := sanitizeForLog(err.Error())
@@ -316,15 +313,7 @@ func dialPublicAddress(
 		}
 	}
 
-	var lastErr error
-	for _, ip := range ips {
-		conn, err := dial(ctx, network, net.JoinHostPort(ip.String(), port))
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
-	}
-	return nil, lastErr
+	return transportdial.DialAddresses(ctx, network, port, ips, dial)
 }
 
 func normalizeHostname(host string) string {
