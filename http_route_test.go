@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -257,6 +258,16 @@ func TestHTTPRouteSelectorReleasesTransport(t *testing.T) {
 	}
 }
 
+type routeRequestBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *routeRequestBody) Close() error {
+	b.closed = true
+	return nil
+}
+
 func TestHTTPRouteSelectorFailureDoesNotFallBack(t *testing.T) {
 	sentinel := errors.New("selection failed")
 	var dials atomic.Int32
@@ -274,10 +285,14 @@ func TestHTTPRouteSelectorFailureDoesNotFallBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
+	body := &routeRequestBody{Reader: strings.NewReader("{}")}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.com/", body)
 	_, err = client.Do(req)
 	if !errors.Is(err, sentinel) || dials.Load() != 0 {
 		t.Fatalf("error=%v dials=%d", err, dials.Load())
+	}
+	if !body.closed {
+		t.Fatal("selection failure left the request body open")
 	}
 }
 
@@ -285,6 +300,7 @@ func TestHTTPRouteSelectorRejectsInvalidRoutes(t *testing.T) {
 	for _, scenario := range []struct {
 		name        string
 		selectRoute HTTPRouteSelector
+		wantError   string
 	}{
 		{name: "nil transport", selectRoute: func(_ *http.Request, _ *http.Transport) (*http.Transport, bool, error) {
 			return nil, false, nil
@@ -300,6 +316,13 @@ func TestHTTPRouteSelectorRejectsInvalidRoutes(t *testing.T) {
 			}
 			return base, false, nil
 		}},
+		{name: "direct legacy dialer", wantError: "requires DialContext", selectRoute: func(_ *http.Request, base *http.Transport) (*http.Transport, bool, error) {
+			base.Proxy = nil
+			base.Dial = func(string, string) (net.Conn, error) { //nolint:staticcheck // Verify legacy dialers are rejected rather than silently bypassed.
+				return nil, errors.New("unexpected legacy dial")
+			}
+			return base, false, nil
+		}},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			ctx := WithHTTPRouteSelector(context.Background(), scenario.selectRoute)
@@ -310,6 +333,8 @@ func TestHTTPRouteSelectorRejectsInvalidRoutes(t *testing.T) {
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
 			if _, err := client.Do(req); err == nil {
 				t.Fatal("invalid route was accepted")
+			} else if scenario.wantError != "" && !strings.Contains(err.Error(), scenario.wantError) {
+				t.Fatalf("error=%v, want %q", err, scenario.wantError)
 			}
 		})
 	}
@@ -368,5 +393,162 @@ func TestHTTPRouteSelectorRejectsSharedProtocolCallbacks(t *testing.T) {
 				t.Fatalf("custom callbacks invoked %d times", callbacks.Load())
 			}
 		})
+	}
+}
+
+func routeTestResolver(t *testing.T, answer net.IP) (*net.Resolver, *atomic.Int32) {
+	t.Helper()
+	var workers sync.WaitGroup
+	calls := &atomic.Int32{}
+	resolver := &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
+		calls.Add(1)
+		client, server := net.Pipe()
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			defer server.Close()
+			var size [2]byte
+			if _, err := io.ReadFull(server, size[:]); err != nil {
+				return
+			}
+			query := make([]byte, binary.BigEndian.Uint16(size[:]))
+			if _, err := io.ReadFull(server, query); err != nil || len(query) < 17 {
+				return
+			}
+			end := 12
+			for end < len(query) && query[end] != 0 {
+				end += int(query[end]) + 1
+			}
+			end++
+			if end+4 > len(query) {
+				return
+			}
+			kind := binary.BigEndian.Uint16(query[end : end+2])
+			reply := append([]byte(nil), query[:end+4]...)
+			reply[2], reply[3] = 0x81, 0x80
+			for i := 6; i < 12; i++ {
+				reply[i] = 0
+			}
+			if kind == 1 {
+				reply[7] = 1
+				reply = append(reply, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4)
+				reply = append(reply, answer.To4()...)
+			}
+			binary.BigEndian.PutUint16(size[:], uint16(len(reply)))
+			_, _ = server.Write(append(size[:], reply...))
+		}()
+		return client, nil
+	}}
+	t.Cleanup(workers.Wait)
+	return resolver, calls
+}
+
+func TestHTTPResolverSelectedDirect(t *testing.T) {
+	for _, skip := range []bool{false, true} {
+		name := "guarded"
+		if skip {
+			name = "skip"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(allowInsecureRemoteURLEnv, "")
+			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "metadata") }))
+			t.Cleanup(origin.Close)
+			resolver, calls := routeTestResolver(t, net.IPv4(127, 0, 0, 1))
+			logger := &testLogger{}
+			ctx, recorder := contextWithSSRFRecorder(WithLogger(context.Background(), logger))
+			if skip {
+				ctx = WithSkipSSRFCheck(ctx)
+			}
+			ctx = WithHTTPResolver(ctx, resolver)
+			var address string
+			ctx = WithHTTPRouteSelector(ctx, func(_ *http.Request, base *http.Transport) (*http.Transport, bool, error) {
+				base.Proxy = nil
+				base.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					address = addr
+					return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
+				}
+				return base, false, nil
+			})
+			client, err := newAuthorizationServerHTTPClient(ctx, origin.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.Timeout = 5 * time.Second
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://selected.example.com/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if address != "127.0.0.1:443" || calls.Load() == 0 {
+				t.Fatalf("address=%q DNS calls=%d", address, calls.Load())
+			}
+			warned := strings.Contains(strings.Join(logger.warns, "\n"), "resolved to disallowed address")
+			if warned == skip {
+				t.Fatalf("skip=%v warnings=%v", skip, logger.warns)
+			}
+			if recorder.failed == skip {
+				t.Fatalf("skip=%v recorded rejection=%v", skip, recorder.failed)
+			}
+		})
+	}
+}
+
+func TestHTTPResolverNotUsedForUpstream(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "remote") }))
+	t.Cleanup(origin.Close)
+	var lookups atomic.Int32
+	resolver := &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
+		lookups.Add(1)
+		return nil, errors.New("unexpected local DNS lookup")
+	}}
+	ctx := WithHTTPResolver(context.Background(), resolver)
+	ctx = WithHTTPRouteSelector(ctx, func(_ *http.Request, base *http.Transport) (*http.Transport, bool, error) {
+		base.Proxy = nil
+		base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
+		}
+		return base, true, nil
+	})
+	client, err := newAuthorizationServerHTTPClient(ctx, origin.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Timeout = 5 * time.Second
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://selected.example.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookups.Load() != 0 {
+		t.Fatalf("proxied request performed %d local lookups", lookups.Load())
+	}
+}
+
+func TestHTTPResolverNilUsesDefault(t *testing.T) {
+	ctx := WithHTTPResolver(context.Background(), nil)
+	ctx = WithHTTPRouteSelector(ctx, func(_ *http.Request, base *http.Transport) (*http.Transport, bool, error) { return base, false, nil })
+	client, err := newAuthorizationServerHTTPClient(ctx, &http.Client{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed, ok := client.Transport.(*routedAuthorizationServerTransport)
+	if !ok || routed.resolver != net.DefaultResolver {
+		t.Fatalf("resolver=%v, want net.DefaultResolver", client.Transport)
 	}
 }

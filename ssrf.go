@@ -134,7 +134,11 @@ var authorizationServerHTTPClientFunc = newAuthorizationServerHTTPClient
 // only vet the proxy's address while a direct connection fails on hosts whose
 // only egress is the proxy. Such requests get the URL checks alone.
 func newAuthorizationServerHTTPClient(ctx context.Context, client *http.Client) (*http.Client, error) {
-	return newAuthorizationServerHTTPClientWithResolver(ctx, client, net.DefaultResolver)
+	resolver, _ := ctx.Value(httpResolverKey{}).(*net.Resolver)
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	return newAuthorizationServerHTTPClientWithResolver(ctx, client, resolver)
 }
 
 func newAuthorizationServerHTTPClientWithResolver(ctx context.Context, client *http.Client, resolver ipResolver) (*http.Client, error) {
@@ -297,10 +301,26 @@ func dialPublicAddress(
 	dial func(context.Context, string, string) (net.Conn, error),
 	network, host, port string,
 ) (net.Conn, error) {
+	return dialResolvedAddress(ctx, resolver, dial, network, host, port, true)
+}
+
+func dialResolvedAddress(
+	ctx context.Context,
+	resolver ipResolver,
+	dial func(context.Context, string, string) (net.Conn, error),
+	network, host, port string,
+	guard bool,
+) (net.Conn, error) {
 	logger := loggerFromContext(ctx)
+	validate := func(ip netip.Addr) error {
+		if !guard {
+			return nil
+		}
+		return validateDialAddr(ctx, ip)
+	}
 
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if err := validateDialAddr(ctx, ip); err != nil {
+		if err := validate(ip); err != nil {
 			safeIP := sanitizeForLog(ip.String())
 			safeErr := sanitizeForLog(err.Error())
 			logger.Warnf("authorization server dial address %s was rejected by the SSRF guard; dialing anyway: %s", safeIP, safeErr)
@@ -317,7 +337,7 @@ func dialPublicAddress(
 		return nil, fmt.Errorf("authorization server host %q did not resolve to any IP addresses", host)
 	}
 	for _, ip := range ips {
-		if err := validateDialAddr(ctx, ip); err != nil {
+		if err := validate(ip); err != nil {
 			safeHost := sanitizeForLog(host)
 			safeIP := sanitizeForLog(ip.String())
 			safeErr := sanitizeForLog(err.Error())

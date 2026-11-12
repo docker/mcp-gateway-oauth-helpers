@@ -18,11 +18,24 @@ import (
 // destination to a captured upstream proxy without resolving it locally.
 // Returned transports must not contain custom TLSNextProto callbacks, which can
 // retain shared connection pools. An empty map may disable protocol upgrades.
-// A guarded direct route must not use custom TLS dialers.
+// Direct routes using the guard or WithHTTPResolver must use DialContext for
+// custom dialing and must not use custom TLS dialers.
 // Selectors must respect req.Context() and must not change shared transports.
 type HTTPRouteSelector func(req *http.Request, base *http.Transport) (transport *http.Transport, upstreamResolvesTarget bool, err error)
 
-type httpRouteSelectorKey struct{}
+type (
+	httpRouteSelectorKey struct{}
+	httpResolverKey      struct{}
+)
+
+// WithHTTPResolver selects the DNS resolver for guarded direct authorization-server
+// requests. WithHTTPRouteSelector also applies this resolver to DIRECT routes
+// when the SSRF guard is skipped: dialers receive resolved IP addresses without
+// checks or warnings. A nil resolver uses net.DefaultResolver. Upstream-resolved
+// requests do not use this resolver.
+func WithHTTPResolver(ctx context.Context, resolver *net.Resolver) context.Context {
+	return context.WithValue(ctx, httpResolverKey{}, resolver)
+}
 
 // WithHTTPRouteSelector selects a fresh transport for each authorization-server
 // request and redirect. It preserves routing when WithSkipSSRFCheck is set.
@@ -33,7 +46,8 @@ func WithHTTPRouteSelector(ctx context.Context, selector HTTPRouteSelector) cont
 
 func newRoutedAuthorizationServerHTTPClient(ctx context.Context, client *http.Client, resolver ipResolver, selector HTTPRouteSelector) (*http.Client, error) {
 	guard := !allowInsecureRemoteURLs() && !skipSSRFCheck(ctx)
-	if guard && resolver == nil {
+	_, resolveDirect := ctx.Value(httpResolverKey{}).(*net.Resolver)
+	if (guard || resolveDirect) && resolver == nil {
 		return nil, fmt.Errorf("IP resolver is nil")
 	}
 	base := client.Transport
@@ -45,18 +59,25 @@ func newRoutedAuthorizationServerHTTPClient(ctx context.Context, client *http.Cl
 		return nil, fmt.Errorf("HTTP transport %T cannot select a route", base)
 	}
 	routed := *client
-	routed.Transport = &routedAuthorizationServerTransport{base: transport, selector: selector, resolver: resolver, guard: guard}
+	routed.Transport = &routedAuthorizationServerTransport{base: transport, selector: selector, resolver: resolver, guard: guard, resolveDirect: resolveDirect}
 	return &routed, nil
 }
 
 type routedAuthorizationServerTransport struct {
-	base     *http.Transport
-	selector HTTPRouteSelector
-	resolver ipResolver
-	guard    bool
+	base          *http.Transport
+	selector      HTTPRouteSelector
+	resolver      ipResolver
+	guard         bool
+	resolveDirect bool
 }
 
 func (t *routedAuthorizationServerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	dispatched := false
+	defer func() {
+		if !dispatched && req.Body != nil {
+			_ = req.Body.Close()
+		}
+	}()
 	if t.guard {
 		if err := checkAuthorizationServerRequest(req); err != nil {
 			return nil, err
@@ -85,14 +106,18 @@ func (t *routedAuthorizationServerTransport) RoundTrip(req *http.Request) (*http
 		return nil, fmt.Errorf("selected HTTP route must not use custom TLS protocol callbacks")
 	}
 	transport.DisableKeepAlives = true
-	if t.guard && !upstreamResolvesTarget {
+	if (t.guard || t.resolveDirect) && !upstreamResolvesTarget {
 		if transport.DialTLS != nil || //nolint:staticcheck // A legacy TLS dialer would bypass the guarded DialContext.
 			transport.DialTLSContext != nil {
 			transport.CloseIdleConnections()
-			return nil, fmt.Errorf("HTTP transport with a custom TLS dialer cannot be guarded at dial time")
+			return nil, fmt.Errorf("HTTP transport with a custom TLS dialer cannot resolve direct addresses")
 		}
 		dial := transport.DialContext
 		if dial == nil {
+			if transport.Dial != nil { //nolint:staticcheck // A legacy dialer cannot honor request cancellation.
+				transport.CloseIdleConnections()
+				return nil, fmt.Errorf("selected direct HTTP route requires DialContext for custom dialing")
+			}
 			dial = (&net.Dialer{}).DialContext
 		}
 		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -100,9 +125,10 @@ func (t *routedAuthorizationServerTransport) RoundTrip(req *http.Request) (*http
 			if err != nil {
 				return nil, fmt.Errorf("invalid authorization server dial address %q: %w", address, err)
 			}
-			return dialPublicAddress(ctx, t.resolver, dial, network, host, port)
+			return dialResolvedAddress(ctx, t.resolver, dial, network, host, port, t.guard)
 		}
 	}
+	dispatched = true
 	resp, err := transport.RoundTrip(req)
 	if err != nil {
 		transport.CloseIdleConnections()
