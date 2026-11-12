@@ -25,7 +25,8 @@ unparseable JSON, issuer mismatch).
 
 For a single `DiscoverOAuthRequirements` call, `WithSkipSSRFCheck(ctx)` turns
 the guard off entirely for that call: no scheme/hostname/address checks, no
-dial-time pinning, and no warning log. Use it when the caller has already
+dial-time pinning, and no warning log, unless explicit routing and DNS options
+retain literal dialing as described below. Use it when the caller has already
 made its own trust decision about the target (e.g. an operator explicitly
 opted a request out of the guard).
 
@@ -51,6 +52,16 @@ neither depending on what the caller needs:
 ctx := oauth.WithAllowLocalHTTP(context.Background())
 discovery, err := oauth.DiscoverOAuthRequirements(ctx, "http://localhost:8080/mcp")
 ```
+
+## HTTP routing and DNS
+
+`WithHTTPRouteSelector(ctx, selector)` selects a fresh transport for each authorization-server request and redirect before a connection pool is consulted. The selector returns a transport with `Proxy` unset and reports whether its captured upstream proxy resolves the destination. `WithHTTPResolver(ctx, resolver)` selects the resolver for direct requests; upstream-resolved requests keep remote DNS. Direct requests check every resolved address before dialing only those literals. The guard remains advisory: a flagged address produces a warning and the request proceeds.
+
+Guarded requests use a single-use transport, including requests without a route selector. This prevents an earlier connection from bypassing a new route or DNS decision, at the cost of a new connection and TLS handshake per request. Built-in HTTP/2 is supported. Custom TLS dialers, nonempty `TLSNextProto` callback maps (including those installed by `http2.ConfigureTransport`), and custom `Dial` hooks without `DialContext` are rejected. Use a context-aware `DialContext` and the transport's built-in protocol support instead.
+
+DNS and connection setup honor request cancellation and the client's timeout. A custom client with no timeout gets a 30-second DNS and connection-setup limit; this does not add a response-header or body timeout. TLS handshakes retain the client's timeout and `TLSHandshakeTimeout` behavior. Address fallback starts the alternate IP family after 300 milliseconds or when the first family exhausts its candidates. Candidates within one family share the remaining connection budget.
+
+`WithSkipSSRFCheck` without a route selector retains its existing unguarded behavior. An explicit route selector still selects routes when the guard is skipped. Combining the selector with an explicit resolver resolves direct requests to IP literals without checks or warnings; upstream-resolved routes remain unchanged.
 
 ## Reusing a registration (RFC 7592)
 
