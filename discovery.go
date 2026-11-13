@@ -434,8 +434,11 @@ func validateProtectedResource(expected, actual string) error {
 // echo a request URL verbatim, and some resource servers legitimately publish
 // themselves at origin granularity even though a given MCP endpoint has a
 // path (e.g. Slack's protected-resource document names "https://mcp.slack.com"
-// for its "https://mcp.slack.com/mcp" endpoint). A document naming any other
-// path is still rejected by the exact-match check above.
+// for its "https://mcp.slack.com/mcp" endpoint). An explicit root slash counts
+// as the bare origin, per RFC 3986 (Miro's document names
+// "https://mcp.miro.com/" for its "https://mcp.miro.com/mcp" endpoint). A
+// document naming any other path is still rejected by the exact-match check
+// above.
 func resourceNamesOrigin(actual, expected string) bool {
 	a, err := url.Parse(actual)
 	if err != nil {
@@ -446,7 +449,7 @@ func resourceNamesOrigin(actual, expected string) bool {
 		return false
 	}
 	return e.Path != "" &&
-		a.Path == "" && a.RawQuery == "" && a.Fragment == "" &&
+		(a.Path == "" || a.Path == "/") && a.RawQuery == "" && a.Fragment == "" &&
 		a.User == nil && e.User == nil &&
 		strings.EqualFold(a.Scheme, e.Scheme) && strings.EqualFold(a.Host, e.Host)
 }
