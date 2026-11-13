@@ -1369,6 +1369,11 @@ func TestValidateProtectedResource(t *testing.T) {
 		{"https://h", "https://h/#f", false},
 		{"https://h", "http://h/", false},
 		{"https://h/mcp", "https://h", true},
+		{"https://h/mcp", "https://h/", true},
+		{"https://h/mcp", "https://H/", true},
+		{"https://h/mcp", "https://h/other", false},
+		{"https://h/mcp", "https://h/?x=1", false},
+		{"https://h/mcp", "http://h/", false},
 		{"https://user@h/", "https://h", false},
 	}
 
